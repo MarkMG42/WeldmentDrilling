@@ -588,26 +588,20 @@ End Sub
 
 Private Function BestHoleFace(ByVal body As SldWorks.Body2) As SldWorks.Face2
     Dim face As SldWorks.Face2, surface As SldWorks.Surface
-    Dim holeLoop As SldWorks.Loop2, count As Long, bestCount As Long, area As Double, candidateArea As Double
+    Dim holeLoop As SldWorks.Loop2
     Set face = body.GetFirstFace
     Do While Not face Is Nothing
         Set surface = face.GetSurface
         If Not surface Is Nothing Then
         If surface.IsPlane Then
-            count = 0
             Set holeLoop = face.GetFirstLoop
             Do While Not holeLoop Is Nothing
-                If IsRoundOpening(holeLoop) Then count = count + 1
+                If IsRoundOpening(holeLoop) Then
+                    Set BestHoleFace = face
+                    Exit Function
+                End If
                 Set holeLoop = holeLoop.GetNext
             Loop
-            If count > 0 Then
-                candidateArea = face.GetArea
-                If count > bestCount Or (count = bestCount And candidateArea > area) Then
-                    bestCount = count
-                    area = candidateArea
-                    Set BestHoleFace = face
-                End If
-            End If
         End If
         End If
         Set face = face.GetNextFace
@@ -615,8 +609,14 @@ Private Function BestHoleFace(ByVal body As SldWorks.Body2) As SldWorks.Face2
 End Function
 
 Private Function IsRoundOpening(ByVal holeLoop As SldWorks.Loop2) As Boolean
+    Dim firstCircle As Variant
+    IsRoundOpening = TryRoundOpening(holeLoop, firstCircle)
+End Function
+
+Private Function TryRoundOpening(ByVal holeLoop As SldWorks.Loop2, ByRef firstCircle As Variant) As Boolean
     Dim edges As Variant, edge As SldWorks.Edge, curve As SldWorks.Curve
     Dim circleData As Variant, first As Variant, i As Long, k As Long, dot As Double
+    firstCircle = Empty
     If holeLoop Is Nothing Then Exit Function
     If holeLoop.IsOuter Then Exit Function
     edges = holeLoop.GetEdges
@@ -644,7 +644,8 @@ Private Function IsRoundOpening(ByVal holeLoop As SldWorks.Loop2) As Boolean
     Next i
     ' A closed inner BREP holeLoop made of arcs of the same circleData is a circular opening.
     ' Includes tube bores and countersinks; it is not proof of a machining operation.
-    IsRoundOpening = True
+    firstCircle = first
+    TryRoundOpening = True
 End Function
 
 Private Function ResolvePartBody(ByVal name As String, ByVal config As String) As SldWorks.Body2
@@ -1114,9 +1115,6 @@ Private Sub PlaceDetail(ByVal view As SldWorks.View, ByRef cursorY As Double, By
         result = drawing.DrawingViewRotate(view.Angle + 1.5707963267949)
         If result = False Then Fail "Не удалось повернуть вид горизонтально."
         drawingModel.EditRebuild3
-        outline = ReadOutline(view)
-        width = outline(2) - outline(0)
-        height = outline(3) - outline(1)
     End If
     If HOLES_LEFT Then OrientHolesLeft view
     outline = ReadOutline(view)
@@ -1236,8 +1234,8 @@ Private Function HolesNeedFlip(ByVal meanX As Double, ByVal left As Double, ByVa
 End Function
 
 Private Function HoleMeanX(ByVal view As SldWorks.View, ByRef count As Long) As Double
-    Dim face As SldWorks.Face2, holeLoop As SldWorks.Loop2, edges As Variant
-    Dim edge As SldWorks.Edge, curve As SldWorks.Curve, circleData As Variant, coords As Variant
+    Dim face As SldWorks.Face2, holeLoop As SldWorks.Loop2
+    Dim circleData As Variant, coords As Variant
     Dim utility As SldWorks.MathUtility, point As SldWorks.MathPoint, projected As SldWorks.MathPoint
     Dim transform As SldWorks.MathTransform, xyz(2) As Double, sumX As Double
     Dim holes As Long, area As Double
@@ -1251,14 +1249,7 @@ Private Function HoleMeanX(ByVal view As SldWorks.View, ByRef count As Long) As 
     If utility Is Nothing Then Fail "Нет MathUtility для проекции центров."
     Set holeLoop = face.GetFirstLoop
     Do While Not holeLoop Is Nothing
-        If IsRoundOpening(holeLoop) Then
-            edges = holeLoop.GetEdges
-            If HasItems(edges) = False Then Fail "Нет рёбер круглого контура."
-            Set edge = edges(LBound(edges))
-            If edge Is Nothing Then Fail "Пустое ребро круглого контура."
-            Set curve = edge.GetCurve
-            If curve Is Nothing Then Fail "Нет кривой круглого контура."
-            circleData = curve.CircleParams
+        If TryRoundOpening(holeLoop, circleData) Then
             If HasItems(circleData) = False Then Fail "Нет центра окружности."
             If LBound(circleData) <> 0 Or UBound(circleData) < 6 Then Fail "Неполные параметры окружности."
             xyz(0) = circleData(0): xyz(1) = circleData(1): xyz(2) = circleData(2)
@@ -1786,7 +1777,6 @@ Private Function NativeDimensionView(ByVal view As SldWorks.View, ByVal targetX 
     For i = 1 To groups.Count
         Set group = groups(i)
         index = CLng(group(1))
-        drawingModel.ClearSelection2 True
         NdSelectEdge view, holes(index).Entity, False
         Set display = drawingModel.AddDiameterDimension2(holes(index).X, bounds.MaxY + DIM_BASE_OFFSET + (i - 1) * DIM_LINE_STEP, 0#)
         NdRegister display, 2# * holes(index).Radius, created, expected
@@ -2449,7 +2439,7 @@ Private Function NdPrepareHoles(ByRef holes() As NDHole, ByVal count As Long, By
 End Function
 
 Private Function NdPositions(ByRef holes() As NDHole, ByVal selected As Collection, ByVal horizontal As Boolean, ByVal viewScale As Double) As Collection
-    Dim result As Collection, order() As Long, i As Long, j As Long, index As Long, other As Long, duplicate As Boolean
+    Dim result As Collection, order() As Long, i As Long, index As Long, other As Long, duplicate As Boolean
     Dim first As Double, second As Double
     Set result = New Collection
     If selected.Count > 0 Then
@@ -2460,14 +2450,13 @@ Private Function NdPositions(ByRef holes() As NDHole, ByVal selected As Collecti
             index = order(i)
             If horizontal Then first = holes(index).X Else first = holes(index).Y
             duplicate = False
-            For j = 1 To result.Count
-                other = CLng(result(j))
+            If result.Count > 0 Then
+                other = CLng(result(result.Count))
                 If horizontal Then second = holes(other).X Else second = holes(other).Y
                 If NdPositionNear(first, second, viewScale) Then
                     duplicate = True
-                    Exit For
                 End If
-            Next j
+            End If
             If duplicate = False Then result.Add index
         Next i
     End If
@@ -2475,7 +2464,7 @@ Private Function NdPositions(ByRef holes() As NDHole, ByVal selected As Collecti
 End Function
 
 Private Function NdDiameterGroups(ByRef holes() As NDHole, ByVal selected As Collection, ByVal viewScale As Double) As Collection
-    Dim result As Collection, group As Collection, order() As Long, i As Long, j As Long, index As Long, representative As Long, found As Boolean
+    Dim result As Collection, group As Collection, order() As Long, i As Long, index As Long, representative As Long, found As Boolean
     Set result = New Collection
     If selected.Count > 0 Then
         ReDim order(1 To selected.Count)
@@ -2484,15 +2473,14 @@ Private Function NdDiameterGroups(ByRef holes() As NDHole, ByVal selected As Col
         For i = 1 To selected.Count
             index = order(i)
             found = False
-            For j = 1 To result.Count
-                Set group = result(j)
+            If result.Count > 0 Then
+                Set group = result(result.Count)
                 representative = CLng(group(1))
                 If NdDiameterNear(holes(index).Radius, holes(representative).Radius, viewScale) Then
                     group.Add index
                     found = True
-                    Exit For
                 End If
-            Next j
+            End If
             If found = False Then
                 Set group = New Collection
                 group.Add index
@@ -2519,7 +2507,6 @@ Private Sub NdAddLinear(ByVal view As SldWorks.View, ByVal datum As SldWorks.Edg
                         ByVal x As Double, ByVal y As Double, ByVal expectedValue As Double, ByVal toCircle As Boolean, ByVal viewScale As Double, _
                         ByVal created As Collection, ByVal expected As Collection)
     Dim display As SldWorks.DisplayDimension, dimension As SldWorks.Dimension, i As Long, condition As Long
-    drawingModel.ClearSelection2 True
     NdSelectEdge view, datum, False
     NdSelectEdge view, target, True
     If horizontal Then Set display = drawingModel.AddHorizontalDimension2(x, y, 0#) Else Set display = drawingModel.AddVerticalDimension2(x, y, 0#)
