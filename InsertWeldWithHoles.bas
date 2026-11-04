@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R24_COM_CLEANUP_20261031"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R25_EXPERIMENT_REBUILD_20261104"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -885,25 +885,35 @@ RegisterPasted:
 End Function
 
 Private Sub ApplyDirection(ByVal view As SldWorks.View, ByVal config As String, ByVal direction As Long)
-    Dim body As SldWorks.Body2, singleBody(0) As SldWorks.Body2
     MarkStage "—мена стандартного направлени€"
-    ShowStandardDirection view, direction
+    ShowStandardDirection view, config, direction
+End Sub
+
+Private Function RebuildDirectionView(ByVal view As SldWorks.View, ByVal config As String, ByRef actual As String) As Boolean
+    Dim body As SldWorks.Body2, singleBody(0) As SldWorks.Body2
     MarkStage " онфигураци€ и изол€ци€ тела"
-    view.ReferencedConfiguration = config
+    If StrComp(view.ReferencedConfiguration, config, vbTextCompare) <> 0 Then view.ReferencedConfiguration = config
     Set body = ResolvePartBody(currentBody, config)
     Set singleBody(0) = body
     view.Bodies = singleBody
-    view.UseSheetScale = False
-    view.ScaleDecimal = DETAIL_SCALE
-    view.Angle = 0#
+    If view.UseSheetScale Then view.UseSheetScale = False
+    If view.ScaleDecimal <> DETAIL_SCALE Then view.ScaleDecimal = DETAIL_SCALE
+    If view.Angle <> 0# Then view.Angle = 0#
     If view.SetDisplayMode4(False, swHIDDEN, False, False, True) = False Then Fail "Ќе установлен режим без невидимых линий."
     view.SetDisplayTangentEdges2 swTangentEdgesHidden
     MarkStage "ѕерестроение вида с одним телом"
+    On Error GoTo Failed
     drawingModel.EditRebuild3
-    WriteLog "ќриентаци€ по данным вида: " & view.GetOrientationName
+    actual = view.GetOrientationName
+    On Error GoTo 0
+    WriteLog "ќриентаци€ по данным вида: " & actual
     MarkStage "ѕроверка тела в виде"
     VerifySingleBody view, currentBody, config
-End Sub
+    RebuildDirectionView = True
+    Exit Function
+Failed:
+    WriteLog DescribeError(Err.Number, Err.Source, Err.Description, Erl)
+End Function
 
 Private Function DirectionAliases(ByVal direction As Long) As Variant
     Select Case direction
@@ -921,31 +931,35 @@ Private Function TryShowDirection(ByVal view As SldWorks.View, ByVal name As Str
     On Error GoTo Failed
     SelectDrawingView view
     drawingModel.ShowNamedView2 name, id
-    drawingModel.EditRebuild3
-    WriteLog " оманда направлени€=[" & name & "]; ID=" & CStr(id) & "; факт=[" & view.GetOrientationName & "]"
+    WriteLog " оманда направлени€=[" & name & "]; ID=" & CStr(id)
     TryShowDirection = True
     Exit Function
 Failed:
     WriteLog DescribeError(Err.Number, Err.Source, Err.Description, Erl)
 End Function
 
-Private Sub ShowStandardDirection(ByVal view As SldWorks.View, ByVal direction As Long)
+Private Sub ShowStandardDirection(ByVal view As SldWorks.View, ByVal config As String, ByVal direction As Long)
     Dim aliases As Variant, aliasName As Variant, actual As String, numericAccepted As Boolean
     aliases = DirectionAliases(direction)
     numericAccepted = TryShowDirection(view, "", direction)
     If numericAccepted Then
-        actual = view.GetOrientationName
-        For Each aliasName In aliases
-            If StrComp(actual, CStr(aliasName), vbTextCompare) = 0 Then Exit Sub
-        Next aliasName
+        numericAccepted = RebuildDirectionView(view, config, actual)
+        If numericAccepted Then
+            For Each aliasName In aliases
+                If StrComp(actual, CStr(aliasName), vbTextCompare) = 0 Then Exit Sub
+            Next aliasName
+        End If
     End If
     ' Compatibility with the original working macro's Russian named-view calls.
     For Each aliasName In aliases
         If TryShowDirection(view, CStr(aliasName), -1) Then
-            If StrComp(view.GetOrientationName, CStr(aliasName), vbTextCompare) = 0 Then Exit Sub
+            If RebuildDirectionView(view, config, actual) Then
+                If StrComp(actual, CStr(aliasName), vbTextCompare) = 0 Then Exit Sub
+            End If
         End If
     Next aliasName
     If numericAccepted = False Then Fail "Ќе удалось применить направление ни по ID, ни по имени."
+    If RebuildDirectionView(view, config, actual) = False Then Fail "Ќе удалось перестроить итоговое направление после попыток по именам."
     WriteLog "Ћокализованное им€ не подтверждено; принимаетс€ только фактическа€ видима€ грань с нормалью к наблюдателю."
 End Sub
 
@@ -1788,7 +1802,6 @@ Private Function NativeDimensionView(ByVal view As SldWorks.View, ByVal targetX 
             If StrComp(display.GetText(swDimensionTextPrefix), prefix, vbBinaryCompare) <> 0 Then Fail "Ќе установлено количество отверстий."
         End If
     Next i
-    drawingModel.EditRebuild3
     NdValidateAll created, expected, viewScale
     If (bounds.MaxX - bounds.MinX) / viewScale > BREAK_MODEL_THRESHOLD Then
         unbrokenWidth = bounds.MaxX - bounds.MinX
@@ -1808,7 +1821,6 @@ Private Function NativeDimensionView(ByVal view As SldWorks.View, ByVal targetX 
     position(1) = position(1) + dy
     MarkStage "VBA-размеры: окончательное размещение"
     view.Position = position
-    drawingModel.EditRebuild3
     actual = ReadPosition(view)
     If breakApplied Then
         LogBreakGeometry view, "до выделени€ после перемещени€"
@@ -2105,11 +2117,9 @@ Private Sub NudgeBreakAndRestore(ByVal view As SldWorks.View)
     WriteLog "ѕробное перемещение разрыва: X1=" & CStr(first) & "; X2=" & CStr(second) & "; временно X1=" & CStr(moved)
     attempted = True
     If line.SetPosition(moved, second) = False Then Fail "Ќе удалось временно переместить границу разрыва."
-    drawingModel.EditRebuild3
     If Abs(line.GetPosition(0) - moved) > POSITION_TOLERANCE Or Abs(line.GetPosition(1) - second) > POSITION_TOLERANCE Then _
         Fail "Ќе подтверждено временное перемещение границы разрыва."
     If line.SetPosition(first, second) = False Then Fail "Ќе удалось вернуть границу разрыва."
-    drawingModel.EditRebuild3
     If Abs(line.GetPosition(0) - first) > POSITION_TOLERANCE Or Abs(line.GetPosition(1) - second) > POSITION_TOLERANCE Then _
         Fail "Ќе подтверждЄн возврат границ разрыва."
     WriteLog "√раницы разрыва возвращены к исходным координатам."
