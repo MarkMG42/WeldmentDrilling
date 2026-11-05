@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R26_EXPERIMENT_PLACEMENT_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R27_PROJECTED_SPACING_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -10,7 +10,7 @@ Private Const HOLES_LEFT As Boolean = True
 Private Const HOLE_SIDE_TOLERANCE As Double = 0.0001
 Private Const ALLOW_WORKSPACE_LAYOUT As Boolean = True
 Private Const DETAIL_SCALE As Double = 0.2
-Private Const GAP As Double = 0.005
+Private Const GAP As Double = 0.0025
 Private Const VERBOSE_BREAK_GEOMETRY As Boolean = False
 Private Const BREAK_MODEL_THRESHOLD As Double = 1.2
 Private Const BREAK_MAX_WIDTH As Double = 0.15
@@ -990,11 +990,11 @@ Private Function FindVisibleHoleFace(ByVal view As SldWorks.View, ByRef holes As
                         Set surface = face.GetSurface
                         If Not surface Is Nothing Then
                             If surface.IsPlane Then
-                                Set body = face.GetBody
-                                If Not body Is Nothing Then
-                                    If StrComp(body.Name, currentBody, vbTextCompare) = 0 Then
-                                        facing = FaceFacing(face.Normal, rotation)
-                                        If facing >= 0.9999 Then
+                                facing = FaceFacing(face.Normal, rotation)
+                                If facing >= 0.9999 Then
+                                    Set body = face.GetBody
+                                    If Not body Is Nothing Then
+                                        If StrComp(body.Name, currentBody, vbTextCompare) = 0 Then
                                             count = 0
                                             Set holeLoop = face.GetFirstLoop
                                             Do While Not holeLoop Is Nothing
@@ -1752,9 +1752,11 @@ Private Function NativeDimensionView(ByVal view As SldWorks.View, ByVal targetX 
     originalPosition = ReadPosition(view)
     projectedBefore = view.ProjectedDimensions
     modeKnown = True
-    view.ProjectedDimensions = True
-    If view.ProjectedDimensions = False Then Fail "Не включены проекционные размеры вида."
-    drawingModel.EditRebuild3
+    If projectedBefore = False Then
+        view.ProjectedDimensions = True
+        If view.ProjectedDimensions = False Then Fail "Не включены проекционные размеры вида."
+        drawingModel.EditRebuild3
+    End If
     If view.ProjectedDimensions = False Then Fail "После перестроения сброшен проекционный режим."
     MarkStage "VBA-размеры: чтение геометрии"
     NdReadGeometry view, viewScale, lines, lineCount, holes, holeCount, bounds
@@ -2578,7 +2580,7 @@ Private Function NdDimensionEnvelope(ByVal created As Collection, ByRef bounds A
         If point(1) > maxY Then maxY = point(1)
     Next i
     ' Anchor positions plus allowance, not exact glyph bounds.
-    NdDimensionEnvelope = Array(created.Count, minX - 0.015, minY - 0.015, maxX + 0.015, maxY + 0.015)
+    NdDimensionEnvelope = Array(created.Count, minX - 0.015, minY - 0.01, maxX + 0.015, maxY + 0.01)
 End Function
 
 Private Function NdDeleteDimension(ByVal display As SldWorks.DisplayDimension) As Boolean
