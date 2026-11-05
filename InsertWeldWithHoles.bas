@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R31_TABLE_SORT_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R32_ORDERED_CALLOUTS_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -20,8 +20,8 @@ Private Const BREAK_END_CLEARANCE As Double = 0.015
 Private Const DIM_BASE_OFFSET As Double = 0.007
 Private Const DIM_LINE_STEP As Double = 0.006
 Private Const BALLOON_LEFT_OFFSET As Double = 0.02
-Private Const DETAIL_BALLOON_OFFSET As Double = 0.008
-Private Const DETAIL_BALLOON_RISE As Double = 0.003
+Private Const DETAIL_BALLOON_OFFSET As Double = 0.011
+Private Const DETAIL_BALLOON_RISE As Double = 0.006
 Private Const SIDE_MARGIN As Double = 0.02
 Private Const BOTTOM_MARGIN As Double = 0.04
 Private Const EPS As Double = 0.0000001
@@ -44,6 +44,7 @@ Private sourceLeaderStyleKnown As Boolean
 Private madeTable As SldWorks.WeldmentCutListAnnotation
 Private madeTableReady As Boolean
 Private madeTableOwned As Boolean
+Private detailNumberingPrepared As Boolean
 Private visited As Object
 Private skipped As Collection
 Private orientationWarnings As Collection
@@ -127,6 +128,7 @@ Public Sub start()
     Set madeTable = Nothing
     madeTableReady = False
     madeTableOwned = False
+    detailNumberingPrepared = False
     Set partModel = Nothing
     Set drawingModel = Nothing
     oldConfig = ""
@@ -212,7 +214,12 @@ Public Sub start()
     Next i
     WriteLog "Время: виды=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с"
     phaseStart = Timer
-    If AUTO_DIMENSIONS And completed > 0 Then DimensionAndArrange width, height
+    If madeTableReady And completed > 0 Then AlignDetailsWithCutList
+    If AUTO_DIMENSIONS And completed > 0 Then
+        DimensionAndArrange width, height
+    ElseIf completed > 0 Then
+        ArrangeOrderedDetails width, height
+    End If
     WriteLog "Время: размеры и разрывы=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с"
     phaseStart = Timer
     If ADD_BALLOONS And completed > 0 Then
@@ -1556,6 +1563,195 @@ Unknown:
     CountOutsideLayout = -1
 End Function
 
+Private Function ViewCutListItem(ByVal view As SldWorks.View) As String
+    Dim face As SldWorks.Face2, entity As SldWorks.Entity, data As SldWorks.SelectData
+    Dim options As SldWorks.BalloonOptions, note As SldWorks.Note
+    Dim holes As Long, area As Double, item As String, warning As String, errorText As String
+    On Error GoTo Failed
+    Set face = FindVisibleHoleFace(view, holes, area)
+    If face Is Nothing Then Fail "Не найдена грань для определения строки списка вырезов."
+    Set entity = face
+    Set data = drawingModel.SelectionManager.CreateSelectData
+    If data Is Nothing Then Fail "Не создан контекст определения строки."
+    data.View = view
+    drawingModel.ClearSelection2 True
+    If entity.Select4(False, data) = False Then Fail "Не выбрана грань для определения строки."
+    Set options = drawingModel.Extension.CreateBalloonOptions
+    If options Is Nothing Then Fail "Нет параметров временной позиции."
+    options.Style = swBS_None
+    options.UpperTextContent = swBalloonTextItemNumber
+    options.ShowQuantity = False
+    Set note = drawingModel.Extension.InsertBOMBalloon2(options)
+    If note Is Nothing Then Fail "Не создана временная связанная позиция."
+    If TryReadItemNumber(note, item, warning) = False Then Fail warning
+    If TryDeleteSourceNote(note) = False Then Fail "Не удалена временная позиция."
+    Set note = Nothing
+    drawingModel.ClearSelection2 True
+    ViewCutListItem = item
+    Exit Function
+Failed:
+    errorText = Err.Description
+    If Not note Is Nothing Then
+        If TryDeleteSourceNote(note) = False Then errorText = errorText & "; временная позиция осталась на виде"
+    End If
+    Fail "Не определена строка вида [" & view.GetName2 & "]: " & errorText
+End Function
+
+Private Function DetailFirstOrder(ByVal count As Long, ByVal selectedRows As Object) As Long()
+    Dim result() As Long, i As Long, target As Long
+    If count < 1 Then Fail "Нет строк для согласования."
+    ReDim result(0 To count - 1)
+    For i = 0 To count - 1
+        If selectedRows.Exists(CStr(i)) Then
+            result(target) = i
+            target = target + 1
+        End If
+    Next i
+    For i = 0 To count - 1
+        If selectedRows.Exists(CStr(i)) = False Then
+            result(target) = i
+            target = target + 1
+        End If
+    Next i
+    DetailFirstOrder = result
+End Function
+
+Public Sub TestDetailFirstOrder()
+    Dim selected As Object, order() As Long, i As Long, expected As Variant
+    Set selected = CreateObject("Scripting.Dictionary")
+    selected.Add "4", True
+    selected.Add "0", True
+    selected.Add "2", True
+    order = DetailFirstOrder(6, selected)
+    expected = Array(0, 2, 4, 1, 3, 5)
+    For i = 0 To 5
+        If order(i) <> CLng(expected(i)) Then Fail "Order: incorrect promotion of selected rows"
+    Next i
+    selected.RemoveAll
+    order = DetailFirstOrder(3, selected)
+    For i = 0 To 2
+        If order(i) <> i Then Fail "Order: empty selection changed order"
+        selected.Add CStr(i), True
+    Next i
+    order = DetailFirstOrder(3, selected)
+    For i = 0 To 2
+        If order(i) <> i Then Fail "Order: full selection changed order"
+    Next i
+    MsgBox BUILD_ID & ": TestDetailFirstOrder passed; без изменения таблицы в SOLIDWORKS.", vbInformation
+End Sub
+
+Private Sub AlignDetailsWithCutList()
+    Dim table As SldWorks.TableAnnotation, feature As SldWorks.WeldmentCutListFeature
+    Dim itemRows As Object, selectedRows As Object, rowBodies As Object, rowViews As Object
+    Dim views As Collection, names As Collection, view As SldWorks.View
+    Dim firstRow As Long, count As Long, itemColumn As Long, row As Long, column As Long
+    Dim i As Long, j As Long, target As Long, sourceIndex As Long, originalRow As Long, key As Long
+    Dim order() As Long, desired() As Long, item As String
+    Dim savedKeepNumbers As Boolean, savedStart As Long, captured As Boolean, errorText As String
+    On Error GoTo Failed
+    MarkStage "Согласование таблицы и порядка вынесенных видов"
+    Set table = madeTable
+    Set feature = madeTable.WeldmentCutListFeature
+    If feature Is Nothing Then Fail "Нет параметров нумерации списка вырезов."
+    savedKeepNumbers = feature.KeepCurrentItemNumbers
+    savedStart = feature.SequenceStartNumber
+    captured = True
+    If table.GetHeaderStyle <> swTableHeader_Top Then Fail "Для нумерации нужен заголовок таблицы сверху."
+    firstRow = table.GetHeaderCount
+    count = table.RowCount - firstRow
+    If count < madeViews.Count Then Fail "В таблице меньше строк, чем вынесенных видов."
+    itemColumn = -1
+    For column = 0 To table.ColumnCount - 1
+        If table.GetColumnType(column) = swWeldTableColumnType_ItemNumber Then
+            If itemColumn >= 0 Then Fail "В таблице несколько столбцов номеров позиций."
+            itemColumn = column
+        End If
+    Next column
+    If itemColumn < 0 Then Fail "В таблице нет связанного столбца номеров позиций."
+    Set itemRows = CreateObject("Scripting.Dictionary")
+    Set selectedRows = CreateObject("Scripting.Dictionary")
+    Set rowBodies = CreateObject("Scripting.Dictionary")
+    Set rowViews = CreateObject("Scripting.Dictionary")
+    For row = firstRow To table.RowCount - 1
+        item = Trim$(table.DisplayedText(row, itemColumn))
+        If Len(item) = 0 Or itemRows.Exists(item) Then Fail "Пустой или повторный номер строки таблицы."
+        itemRows.Add item, row - firstRow
+    Next row
+    ' A native temporary balloon gives the actual row association, independent of profile names.
+    For i = 1 To madeViews.Count
+        Set view = madeViews(i)
+        item = ViewCutListItem(view)
+        If itemRows.Exists(item) = False Then Fail "Номер вида не найден в таблице: " & item
+        originalRow = CLng(itemRows(item))
+        If selectedRows.Exists(CStr(originalRow)) Then Fail "Два вида соответствуют одной строке таблицы."
+        selectedRows.Add CStr(originalRow), True
+        rowBodies.Add CStr(originalRow), CStr(madeBodyNames(i))
+        rowViews.Add CStr(originalRow), view
+    Next i
+    ReDim order(0 To count - 1)
+    desired = DetailFirstOrder(count, selectedRows)
+    Set views = New Collection
+    Set names = New Collection
+    For i = 0 To count - 1
+        order(i) = i
+        If selectedRows.Exists(CStr(i)) Then
+            views.Add rowViews(CStr(i))
+            names.Add CStr(rowBodies(CStr(i)))
+        End If
+    Next i
+    ' Hold item identities while promoting selected rows, then renumber the complete table.
+    feature.KeepCurrentItemNumbers = True
+    For i = 0 To count - 1
+        sourceIndex = i
+        Do While order(sourceIndex) <> desired(i)
+            sourceIndex = sourceIndex + 1
+        Loop
+        If sourceIndex <> i Then
+            If table.MoveRow(firstRow + sourceIndex, swTableItemInsertPosition_Before, firstRow + i) = False Then _
+                Fail "Не переставлена строка для сквозной нумерации."
+            key = order(sourceIndex)
+            For j = sourceIndex To i + 1 Step -1
+                order(j) = order(j - 1)
+            Next j
+            order(i) = key
+        End If
+    Next i
+    feature.SequenceStartNumber = 1
+    feature.KeepCurrentItemNumbers = False
+    drawingModel.EditRebuild3
+    For i = 1 To views.Count
+        If Trim$(table.DisplayedText(firstRow + i - 1, itemColumn)) <> CStr(i) Then _
+            Fail "Не подтверждена сквозная нумерация таблицы от 1."
+        Set view = views(i)
+        If ViewCutListItem(view) <> CStr(i) Then _
+            Fail "Связанный номер вида не совпал со строкой таблицы: " & CStr(i)
+    Next i
+    Set madeViews = views
+    Set madeBodyNames = names
+    detailNumberingPrepared = True
+    WriteLog "Виды и строки таблицы согласованы: позиции 1.." & CStr(views.Count) & "; остальные строки после них."
+    Exit Sub
+Failed:
+    errorText = Err.Description
+    On Error Resume Next
+    If captured Then
+        feature.SequenceStartNumber = savedStart
+        feature.KeepCurrentItemNumbers = savedKeepNumbers
+        drawingModel.EditRebuild3
+    End If
+    On Error GoTo 0
+    Fail "Не согласованы виды и таблица: " & errorText & ". Проверьте порядок строк таблицы."
+End Sub
+
+Private Sub ArrangeOrderedDetails(ByVal sheetWidth As Double, ByVal sheetHeight As Double)
+    Dim i As Long, cursorY As Double, view As SldWorks.View
+    cursorY = sheetHeight - SIDE_MARGIN
+    For i = 1 To madeViews.Count
+        Set view = madeViews(i)
+        PlaceDetail view, cursorY, sheetWidth, (i = 1)
+    Next i
+End Sub
+
 Private Sub AddPositions()
     Dim i As Long, view As SldWorks.View, warning As String
     On Error GoTo Failed
@@ -1671,12 +1867,18 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
         sourceLeaderStyleKnown = True
     End If
     CacheDetailItemNumber note
+    If detailNumberingPrepared Then
+        If detailItemNumbers.Exists(currentBody) = False Then Fail "Не прочитан итоговый номер вида."
+        If CStr(detailItemNumbers(currentBody)) <> CStr(MadeBodyNameIndex(currentBody)) Then _
+            Fail "Номер позиции не совпал с порядком вынесенных видов."
+    End If
     TryAddPosition = True
     Exit Function
 Failed:
     number = Err.Number
     warning = "Этап [" & currentStage & "]; " & CStr(number) & ": " & Err.Description
     On Error Resume Next
+    If detailItemNumbers.Exists(currentBody) Then detailItemNumbers.Remove currentBody
     If Not annotation Is Nothing Then
         drawingModel.ClearSelection2 True
         If annotation.Select3(False, Nothing) Then
@@ -1687,6 +1889,17 @@ Failed:
     End If
     drawingModel.ClearSelection2 True
     On Error GoTo 0
+End Function
+
+Private Function MadeBodyNameIndex(ByVal name As String) As Long
+    Dim i As Long
+    For i = 1 To madeBodyNames.Count
+        If StrComp(CStr(madeBodyNames(i)), name, vbBinaryCompare) = 0 Then
+            MadeBodyNameIndex = i
+            Exit Function
+        End If
+    Next i
+    Fail "Не найден индекс вынесенной детали."
 End Function
 
 Private Sub SourcePositionWarning(ByVal text As String)
@@ -1723,7 +1936,10 @@ End Function
 Private Sub ShowSourceLeader(ByVal annotation As SldWorks.Annotation)
     Dim status As Long
     If annotation.GetLeaderStyle <> swNO_LEADER Then Exit Sub
-    If sourceLeaderStyleKnown = False Then Fail "Нет подтвержденного стиля видимой линии-выноски."
+    If sourceLeaderStyleKnown = False Then
+        sourceLeaderStyle = swSTRAIGHT
+        sourceLeaderStyleKnown = True
+    End If
     status = annotation.SetLeader3(sourceLeaderStyle, annotation.GetLeaderSide, annotation.GetSmartArrowHeadStyle, _
                                   annotation.GetLeaderPerpendicular, annotation.GetLeaderAllAround, annotation.GetDashedLeader)
     If status <> 0 Then Fail "Не установлен стиль линии-выноски: " & CStr(status)
@@ -1995,12 +2211,19 @@ Private Function SourceAttachmentPoint(ByVal face As SldWorks.Face2) As Variant
     SourceAttachmentPoint = point
 End Function
 
-Private Sub SetSourceSelectionPoint(ByVal face As SldWorks.Face2, ByVal data As SldWorks.SelectData)
-    Dim point As Variant
+Private Sub SetSourceSelectionPoint(ByVal face As SldWorks.Face2, ByVal view As SldWorks.View, _
+                                    ByVal data As SldWorks.SelectData)
+    Dim point As Variant, projected As Variant
+    Dim utility As SldWorks.MathUtility, transform As SldWorks.MathTransform
     point = SourceAttachmentPoint(face)
-    data.X = CDbl(point(0))
-    data.Y = CDbl(point(1))
-    data.Z = CDbl(point(2))
+    Set utility = app.GetMathUtility
+    Set transform = view.ModelToViewTransform
+    If utility Is Nothing Then Fail "Нет MathUtility для выбора грани."
+    If transform Is Nothing Then Fail "Нет преобразования вида для выбора грани."
+    projected = NdProject(utility, transform, Array(CDbl(point(0)), CDbl(point(1)), CDbl(point(2))))
+    data.X = CDbl(projected(0))
+    data.Y = CDbl(projected(1))
+    data.Z = 0#
 End Sub
 
 Private Function TrySourceTextPosition(ByVal face As SldWorks.Face2, ByVal utility As SldWorks.MathUtility, _
@@ -2093,7 +2316,7 @@ Private Function TryAddSourcePosition(ByVal view As SldWorks.View, ByVal face As
     Set data = manager.CreateSelectData
     If data Is Nothing Then Fail "Не создан контекст выбора исходного вида."
     data.View = view
-    SetSourceSelectionPoint face, data
+    SetSourceSelectionPoint face, view, data
     drawingModel.ClearSelection2 True
     If entity.Select4(False, data) = False Then Fail "Не выбрана видимая грань экземпляра."
     If manager.GetSelectedObjectCount2(-1) <> 1 Then Fail "Выбрана не одна грань экземпляра."
