@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R34_ATTACHED_LEADERS_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R35_CHANNEL_LENGTH_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -629,7 +629,7 @@ Private Function CutListProfileRank(ByVal description As String) As Long
         CutListProfileRank = 0
     ElseIf InStr(description, "угол") > 0 Or InStr(description, "angle") > 0 Then
         CutListProfileRank = 1
-    ElseIf InStr(description, "швеллер") > 0 Or InStr(description, "channel") > 0 Then
+    ElseIf InStr(description, "швел") > 0 Or InStr(description, "channel") > 0 Then
         CutListProfileRank = 2
     Else
         CutListProfileRank = 3 ' Unrecognized profiles retain their relative order at the end.
@@ -716,7 +716,7 @@ Private Function TrySortCutList(ByRef warning As String) As Boolean
         desired(i) = i
     Next i
     If recognized = 0 Then Fail "В ячейках не найдены названия труб, уголков или швеллеров; порядок строк не изменён."
-    If recognized < count Then warning = "Неизвестные профили оставлены в конце таблицы: " & CStr(count - recognized) & "."
+    If recognized < count Then WriteLog "Прочие профили оставлены в конце таблицы: " & CStr(count - recognized) & "."
     ' Stable insertion sort: equal lengths and other profiles keep their original order.
     For i = 1 To count - 1
         key = desired(i)
@@ -2558,6 +2558,7 @@ Public Sub TestCutListSort()
     If CutListProfileRank("Труба квадратная 80x80") <> 0 Then Fail "Sort: pipe classification failed"
     If CutListProfileRank("Уголок 50x50") <> 1 Then Fail "Sort: angle classification failed"
     If CutListProfileRank("Швеллер 12") <> 2 Then Fail "Sort: channel classification failed"
+    If CutListProfileRank("Отрезок швелера 8П") <> 2 Then Fail "Sort: single-L channel classification failed"
     If CutListProfileRank("Лист 8") <> 3 Then Fail "Sort: other profile classification failed"
     If TryCutListLength("1 250,5 мм", length) = False Then Fail "Sort: millimetres not parsed"
     If Abs(length - 1250.5) > EPS Then Fail "Sort: incorrect millimetres"
@@ -2568,6 +2569,8 @@ Public Sub TestCutListSort()
     If CutListBefore(0, 100#, 1, 200#) = False Then Fail "Sort: pipe must precede angle"
     If CutListBefore(1, 100#, 2, 200#) = False Then Fail "Sort: angle must precede channel"
     If CutListBefore(0, 200#, 0, 100#) = False Then Fail "Sort: descending length failed"
+    If CutListBefore(2, 1220#, 2, 710#) = False Then Fail "Sort: descending channel length failed"
+    If CutListBefore(2, 560#, 2, 620#) Then Fail "Sort: shorter channel must follow longer channel"
     If CutListBefore(0, 100#, 0, 100#) Then Fail "Sort: equal lengths must remain stable"
     If CutListBefore(3, 200#, 3, 100#) Then Fail "Sort: other profiles must remain stable"
     MsgBox BUILD_ID & ": TestCutListSort passed; без перестановки строк в SOLIDWORKS.", vbInformation
