@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R28_COMPACT_STATUS_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R29_SOURCE_POSITIONS_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -33,6 +33,12 @@ Private oldConfig As String
 Private sourceSheetName As String
 Private madeViews As Collection
 Private madeBodyNames As Collection
+Private madeSourceNotes As Collection
+Private detailItemNumbers As Object
+Private sourceBalloonsCompleted As Long
+Private sourceBalloonsFailed As Long
+Private sourceLeaderStyle As Long
+Private sourceLeaderStyleKnown As Boolean
 Private madeTable As SldWorks.WeldmentCutListAnnotation
 Private madeTableReady As Boolean
 Private visited As Object
@@ -96,6 +102,13 @@ Public Sub start()
     On Error GoTo Failed
     Set madeViews = New Collection
     Set madeBodyNames = New Collection
+    Set madeSourceNotes = New Collection
+    Set detailItemNumbers = CreateObject("Scripting.Dictionary")
+    detailItemNumbers.CompareMode = vbTextCompare
+    sourceBalloonsCompleted = 0
+    sourceBalloonsFailed = 0
+    sourceLeaderStyleKnown = False
+    sourceLeaderStyle = swNO_LEADER
     Set skipped = New Collection
     Set orientationWarnings = New Collection
     Set dimensionWarnings = New Collection
@@ -174,6 +187,9 @@ Public Sub start()
     Else
         WriteLog "Предупреждение таблицы: " & tableWarning
     End If
+    If madeTableReady = False Then
+        MsgBox "Таблица списка вырезов не создана. Выполнение продолжится без позиций.", vbExclamation, "Отверстия"
+    End If
     WriteLog "Время: таблица=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с"
     phaseStart = Timer
     For i = 1 To bodies.Count
@@ -185,7 +201,10 @@ Public Sub start()
     If AUTO_DIMENSIONS And completed > 0 Then DimensionAndArrange width, height
     WriteLog "Время: размеры и разрывы=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с"
     phaseStart = Timer
-    If ADD_BALLOONS And completed > 0 Then AddPositions
+    If ADD_BALLOONS And completed > 0 Then
+        AddPositions
+        AddSourcePositions source, config
+    End If
     WriteLog "Время: позиции=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с; всего=" & _
              Format$(ElapsedSeconds(runStart), "0.00") & " с"
     runCompleted = True
@@ -193,6 +212,7 @@ Public Sub start()
     If AUTO_DIMENSIONS Then message = message & vbCrLf & "Размеры: обработано видов=" & CStr(dimensionsCompleted) & "; не обработано=" & CStr(dimensionsFailed) & "."
     If AUTO_DIMENSIONS Then message = message & vbCrLf & "Разрывов длинных видов=" & CStr(breaksCompleted) & "; пропущено=" & CStr(breakWarnings.Count) & "."
     If ADD_BALLOONS Then message = message & vbCrLf & "Позиции с количеством: создано=" & CStr(balloonsCompleted) & "; пропущено=" & CStr(balloonsFailed) & "."
+    If ADD_BALLOONS Then message = message & vbCrLf & "Позиции исходного вида: создано=" & CStr(sourceBalloonsCompleted) & "; не создано=" & CStr(sourceBalloonsFailed) & "."
     If Len(tableWarning) > 0 Then
         icon = vbExclamation
         message = message & vbCrLf & "Таблица списка вырезов не создана: " & tableWarning
@@ -249,7 +269,8 @@ Failed:
     hadFailure = True
     errorText = DescribeError(Err.Number, Err.Source, Err.Description, Erl)
     WriteLog errorText
-    cleanup = CleanupSince(0)
+    cleanup = CleanupSourcePositions()
+    cleanup = cleanup & CleanupSince(0)
     message = "Операция остановлена: " & errorText & vbCrLf & cleanup
     cleanup = CleanupTable()
     If Len(cleanup) > 0 Then message = message & vbCrLf & cleanup
@@ -1392,6 +1413,7 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
     Dim annotation As SldWorks.Annotation, outline As Variant, position As Variant
     Dim face As SldWorks.Face2, manager As SldWorks.SelectionMgr
     Dim holes As Long, area As Double, x As Double, y As Double, number As Long
+    Dim capturedLeaderStyle As Long, leaderStyleCaptured As Boolean
     On Error GoTo Failed
     MarkStage "Создание связанной позиции и количества"
     MarkStage "Поиск грани для позиции"
@@ -1443,9 +1465,15 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
         Fail "Не подтверждено положение позиции после размещения."
     MarkStage "Проверка текста позиции"
     If Len(Trim$(note.GetText)) = 0 Then Fail "Позиция не показывает номер из списка вырезов."
+    leaderStyleCaptured = TryCaptureSourceLeaderStyle(annotation, capturedLeaderStyle)
     HidePositionLeader annotation, note
     WriteLog "Позиция: тело=[" & currentBody & "]; текст=[" & note.GetText & "]; X=" & CStr(x) & "; Y=" & CStr(y) & "; количество включено"
     drawingModel.ClearSelection2 True
+    If leaderStyleCaptured Then
+        sourceLeaderStyle = capturedLeaderStyle
+        sourceLeaderStyleKnown = True
+    End If
+    CacheDetailItemNumber note
     TryAddPosition = True
     Exit Function
 Failed:
@@ -1462,6 +1490,442 @@ Failed:
     End If
     drawingModel.ClearSelection2 True
     On Error GoTo 0
+End Function
+
+Private Sub SourcePositionWarning(ByVal text As String)
+    balloonWarnings.Add "Исходный вид: " & text
+    WriteLog "Предупреждение позиций исходного вида: " & text
+End Sub
+
+Private Function TryReadItemNumber(ByVal note As SldWorks.Note, ByRef item As String, ByRef warning As String) As Boolean
+    Dim target As Object, options As SldWorks.BalloonOptions
+    On Error GoTo Failed
+    item = ""
+    If note Is Nothing Then Fail "Нет заметки позиции."
+    If note.IsBomBalloon = False Then Fail "Заметка не связана с позицией таблицы."
+    Set options = note.GetBalloonOptions
+    If options Is Nothing Then Fail "Нет параметров позиции."
+    If options.UpperTextContent <> swBalloonTextItemNumber Then Fail "Верхний текст не является номером позиции."
+    Set target = note
+    item = Trim$(CStr(CallByName(target, "GetBomBalloonText", VbMethod, True)))
+    If Len(item) = 0 Then Fail "Пустой номер позиции таблицы."
+    If item = "*" Or item = "-" Or item = "**" Then Fail "Таблица вернула заполнитель вместо номера позиции."
+    TryReadItemNumber = True
+    Exit Function
+Failed:
+    warning = "Не подтвержден номер позиции: " & CStr(Err.Number) & ": " & Err.Description
+End Function
+
+Private Function TryCaptureSourceLeaderStyle(ByVal annotation As SldWorks.Annotation, ByRef style As Long) As Boolean
+    On Error GoTo Unavailable
+    style = annotation.GetLeaderStyle
+    TryCaptureSourceLeaderStyle = style <> swNO_LEADER
+Unavailable:
+End Function
+
+Private Sub ShowSourceLeader(ByVal annotation As SldWorks.Annotation)
+    Dim status As Long
+    If annotation.GetLeaderStyle <> swNO_LEADER Then Exit Sub
+    If sourceLeaderStyleKnown = False Then Fail "Нет подтвержденного стиля видимой линии-выноски."
+    status = annotation.SetLeader3(sourceLeaderStyle, annotation.GetLeaderSide, annotation.GetSmartArrowHeadStyle, _
+                                  annotation.GetLeaderPerpendicular, annotation.GetLeaderAllAround, annotation.GetDashedLeader)
+    If status <> 0 Then Fail "Не установлен стиль линии-выноски: " & CStr(status)
+    If annotation.GetLeaderStyle = swNO_LEADER Then Fail "Линия-выноска новой позиции не видна."
+End Sub
+
+Private Sub CacheDetailItemNumber(ByVal note As SldWorks.Note)
+    Dim item As String, warning As String
+    On Error GoTo Failed
+    If TryReadItemNumber(note, item, warning) = False Then
+        SourcePositionWarning "Тело [" & currentBody & "]: " & warning
+        Exit Sub
+    End If
+    If detailItemNumbers.Exists(currentBody) Then Fail "Повторный представитель позиции списка вырезов."
+    detailItemNumbers.Add currentBody, item
+    Exit Sub
+Failed:
+    SourcePositionWarning "Не сохранен номер тела [" & currentBody & "]: " & Err.Description
+End Sub
+
+Private Sub CollectSourceBodyGroups(ByVal feature As SldWorks.Feature, ByVal targets As Object, _
+                                    ByVal membership As Object, ByVal seen As Object, ByVal subLevel As Boolean)
+    Dim folder As SldWorks.BodyFolder, bodies As Variant, body As SldWorks.Body2
+    Dim names As Object, name As Variant, representative As String, candidate As Variant, matches As Long, i As Long
+    Do While Not feature Is Nothing
+        If feature.GetTypeName2 = "CutListFolder" Then
+            If seen.Exists(feature.Name) = False Then
+                seen.Add feature.Name, True
+                Set folder = feature.GetSpecificFeature2
+                If Not folder Is Nothing Then
+                    bodies = folder.GetBodies
+                    If HasItems(bodies) Then
+                        Set names = CreateObject("Scripting.Dictionary")
+                        names.CompareMode = vbTextCompare
+                        For i = LBound(bodies) To UBound(bodies)
+                            Set body = bodies(i)
+                            If Not body Is Nothing Then
+                                If names.Exists(body.Name) = False Then names.Add body.Name, True
+                            End If
+                        Next i
+                        matches = 0
+                        representative = ""
+                        For Each candidate In madeBodyNames
+                            If names.Exists(CStr(candidate)) Then
+                                matches = matches + 1
+                                representative = CStr(candidate)
+                            End If
+                        Next candidate
+                        For Each name In names.Keys
+                            If membership.Exists(CStr(name)) Then
+                                membership(CStr(name)) = CLng(membership(CStr(name))) + 1
+                            Else
+                                membership.Add CStr(name), 1
+                            End If
+                            If matches > 0 Then
+                                If targets.Exists(CStr(name)) Then
+                                    targets(CStr(name)) = ""
+                                ElseIf matches = 1 Then
+                                    targets.Add CStr(name), representative
+                                Else
+                                    targets.Add CStr(name), ""
+                                End If
+                            End If
+                        Next name
+                    End If
+                End If
+            End If
+        Else
+            CollectSourceBodyGroups feature.GetFirstSubFeature, targets, membership, seen, True
+        End If
+        If subLevel Then
+            Set feature = feature.GetNextSubFeature
+        Else
+            Set feature = feature.GetNextFeature
+        End If
+    Loop
+End Sub
+
+Private Sub AddSourcePositions(ByVal source As SldWorks.View, ByVal config As String)
+    Dim targets As Object, membership As Object, seen As Object, modelCounts As Object, anchors As Object
+    Dim part As SldWorks.PartDoc, modelBodies As Variant, body As SldWorks.Body2
+    Dim components As Variant, faces As Variant, component As SldWorks.Component2, face As SldWorks.Face2
+    Dim existing As SldWorks.Face2, key As Variant, representative As String, name As String, warning As String
+    Dim utility As SldWorks.MathUtility, transform As SldWorks.MathTransform, outline As Variant
+    Dim positions As Collection, xy As Variant, x As Double, y As Double, moved As Boolean
+    Dim i As Long, j As Long, k As Long, missing As Long, errorText As String, cleanup As String
+    On Error GoTo Failed
+    If madeTableReady = False Or madeTable Is Nothing Then Exit Sub
+    If StrComp(ActivePartConfiguration(), config, vbTextCompare) <> 0 Then Fail "Изменилась конфигурация исходного вида."
+    If StrComp(source.ReferencedConfiguration, config, vbTextCompare) <> 0 Then Fail "Исходный вид ссылается на другую конфигурацию."
+    EnsureSourceSheetActive
+    Set targets = CreateObject("Scripting.Dictionary")
+    Set membership = CreateObject("Scripting.Dictionary")
+    Set seen = CreateObject("Scripting.Dictionary")
+    Set modelCounts = CreateObject("Scripting.Dictionary")
+    Set anchors = CreateObject("Scripting.Dictionary")
+    targets.CompareMode = vbTextCompare
+    membership.CompareMode = vbTextCompare
+    seen.CompareMode = vbTextCompare
+    modelCounts.CompareMode = vbTextCompare
+    anchors.CompareMode = vbTextCompare
+    CollectSourceBodyGroups partModel.FirstFeature, targets, membership, seen, False
+    For Each key In madeBodyNames
+        name = CStr(key)
+        warning = ""
+        If membership.Exists(name) = False Then
+            warning = "Представитель не найден в списке вырезов."
+        ElseIf CLng(membership(name)) <> 1 Then
+            warning = "Представитель входит в несколько групп списка вырезов."
+        ElseIf targets.Exists(name) = False Then
+            warning = "Не построено соответствие представителя группе."
+        ElseIf StrComp(CStr(targets(name)), name, vbTextCompare) <> 0 Then
+            warning = "Неоднозначное соответствие представителя группе."
+        End If
+        If Len(warning) > 0 Then
+            SourcePositionWarning "Тело [" & name & "]: " & warning
+            If detailItemNumbers.Exists(name) Then detailItemNumbers.Remove name
+        End If
+    Next key
+    Set part = partModel
+    modelBodies = part.GetBodies2(swAllBodies, False)
+    If HasItems(modelBodies) = False Then Fail "Не получены тела исходной конфигурации."
+    For i = LBound(modelBodies) To UBound(modelBodies)
+        Set body = modelBodies(i)
+        If Not body Is Nothing Then
+            name = body.Name
+            If modelCounts.Exists(name) Then
+                modelCounts(name) = CLng(modelCounts(name)) + 1
+            Else
+                modelCounts.Add name, 1
+            End If
+        End If
+    Next i
+    For Each key In madeBodyNames
+        name = CStr(key)
+        warning = ""
+        If modelCounts.Exists(name) = False Then
+            warning = "Представитель не найден в исходной конфигурации."
+        ElseIf CLng(modelCounts(name)) <> 1 Then
+            warning = "Имя представителя не уникально в исходной конфигурации."
+        End If
+        If Len(warning) > 0 Then
+            SourcePositionWarning "Тело [" & name & "]: " & warning
+            If detailItemNumbers.Exists(name) Then detailItemNumbers.Remove name
+        End If
+    Next key
+    components = source.GetVisibleComponents
+    If HasItems(components) = False Then Fail "Нет доступных видимых компонентов исходного вида."
+    For i = LBound(components) To UBound(components)
+        Set component = components(i)
+        If Not component Is Nothing Then
+            faces = source.GetVisibleEntities2(component, swViewEntityType_Face)
+            If HasItems(faces) Then
+                For j = LBound(faces) To UBound(faces)
+                    Set face = faces(j)
+                    If Not face Is Nothing Then
+                        Set body = face.GetBody
+                        If Not body Is Nothing Then
+                            name = body.Name
+                            If targets.Exists(name) Then
+                                If anchors.Exists(name) Then
+                                    Set existing = anchors(name)
+                                    If face.GetArea > existing.GetArea Then Set anchors(name) = face
+                                Else
+                                    anchors.Add name, face
+                                End If
+                            End If
+                        End If
+                    End If
+                Next j
+            End If
+        End If
+    Next i
+    missing = 0
+    For Each key In targets.Keys
+        If anchors.Exists(CStr(key)) = False Then missing = missing + 1
+    Next key
+    If missing > 0 Then WriteLog "Без доступной видимой грани: " & CStr(missing) & ". Скрытые экземпляры штатно не помечаются."
+    Set utility = app.GetMathUtility
+    Set transform = source.ModelToViewTransform
+    If utility Is Nothing Then Fail "Нет MathUtility для исходного вида."
+    If transform Is Nothing Then Fail "Нет преобразования исходного вида."
+    outline = ReadOutline(source)
+    Set positions = New Collection
+    For Each key In anchors.Keys
+        name = CStr(key)
+        currentBody = name
+        currentView = source.GetName2
+        warning = ""
+        representative = CStr(targets(name))
+        If Len(representative) = 0 Then
+            warning = "Неоднозначная группа списка вырезов."
+        ElseIf membership.Exists(name) = False Then
+            warning = "Не подтверждена принадлежность списку вырезов."
+        ElseIf CLng(membership(name)) <> 1 Then
+            warning = "Тело входит в несколько групп списка вырезов."
+        ElseIf modelCounts.Exists(name) = False Then
+            warning = "Тело не найдено в исходной конфигурации."
+        ElseIf CLng(modelCounts(name)) <> 1 Then
+            warning = "Имя тела не уникально в исходной конфигурации."
+        ElseIf detailItemNumbers.Exists(representative) = False Then
+            warning = "Нет подтвержденного номера вынесенной детали."
+        End If
+        If Len(warning) > 0 Then
+            sourceBalloonsFailed = sourceBalloonsFailed + 1
+            SourcePositionWarning "Тело [" & name & "]: " & warning
+        Else
+            Set face = anchors(name)
+            If TrySourceTextPosition(face, utility, transform, outline, x, y, warning) = False Then
+                sourceBalloonsFailed = sourceBalloonsFailed + 1
+                SourcePositionWarning "Тело [" & name & "]: " & warning
+            Else
+                For k = 1 To 2 * positions.Count + 1
+                    moved = False
+                    For i = 1 To positions.Count
+                        xy = positions(i)
+                        If Abs(x - CDbl(xy(0))) < 0.008 And Abs(y - CDbl(xy(1))) < 0.008 Then
+                            y = y + 0.008
+                            moved = True
+                            Exit For
+                        End If
+                    Next i
+                    If moved = False Then Exit For
+                Next k
+                moved = False
+                For i = 1 To positions.Count
+                    xy = positions(i)
+                    If Abs(x - CDbl(xy(0))) < 0.008 And Abs(y - CDbl(xy(1))) < 0.008 Then moved = True
+                Next i
+                If moved Then
+                    sourceBalloonsFailed = sourceBalloonsFailed + 1
+                    SourcePositionWarning "Тело [" & name & "]: не найден свободный интервал для текста позиции."
+                ElseIf TryAddSourcePosition(source, face, name, CStr(detailItemNumbers(representative)), x, y, warning) Then
+                    positions.Add Array(x, y)
+                    sourceBalloonsCompleted = sourceBalloonsCompleted + 1
+                Else
+                    sourceBalloonsFailed = sourceBalloonsFailed + 1
+                    SourcePositionWarning "Тело [" & name & "]: " & warning
+                End If
+            End If
+        End If
+    Next key
+    If anchors.Count = 0 Then SourcePositionWarning "Не найдены видимые экземпляры вынесенных деталей."
+    drawingModel.ClearSelection2 True
+    Exit Sub
+Failed:
+    errorText = DescribeError(Err.Number, Err.Source, Err.Description, Erl)
+    cleanup = CleanupSourcePositions()
+    sourceBalloonsCompleted = 0
+    sourceBalloonsFailed = sourceBalloonsFailed + 1
+    SourcePositionWarning "Этап позиций исходного вида прерван; вынесенные виды сохранены. " & errorText & cleanup
+    On Error Resume Next
+    drawingModel.ClearSelection2 True
+    On Error GoTo 0
+End Sub
+
+Private Function TrySourceTextPosition(ByVal face As SldWorks.Face2, ByVal utility As SldWorks.MathUtility, _
+                                       ByVal transform As SldWorks.MathTransform, ByVal outline As Variant, _
+                                       ByRef x As Double, ByRef y As Double, ByRef warning As String) As Boolean
+    Dim box As Variant, coords As Variant
+    On Error GoTo Failed
+    box = face.GetBox
+    If HasItems(box) = False Then Fail "Не получены границы грани исходного вида."
+    If LBound(box) <> 0 Or UBound(box) < 5 Then Fail "Некорректные границы грани исходного вида."
+    coords = NdProject(utility, transform, Array((CDbl(box(0)) + CDbl(box(3))) / 2#, _
+                       (CDbl(box(1)) + CDbl(box(4))) / 2#, (CDbl(box(2)) + CDbl(box(5))) / 2#))
+    If CDbl(coords(0)) < (CDbl(outline(0)) + CDbl(outline(2))) / 2# Then
+        x = CDbl(coords(0)) - 0.015
+    Else
+        x = CDbl(coords(0)) + 0.015
+    End If
+    y = CDbl(coords(1)) + 0.008
+    TrySourceTextPosition = True
+    Exit Function
+Failed:
+    warning = "Не определено положение текста: " & CStr(Err.Number) & ": " & Err.Description
+End Function
+
+Private Function SourceBalloonAttachedToBody(ByVal annotation As SldWorks.Annotation, ByVal name As String) As Boolean
+    Dim target As Object, entities As Variant, entity As Object, face As SldWorks.Face2, body As SldWorks.Body2, i As Long
+    On Error GoTo Failed
+    Set target = annotation
+    entities = CallByName(target, "GetAttachedEntities3", VbMethod)
+    If HasItems(entities) = False Then Exit Function
+    For i = LBound(entities) To UBound(entities)
+        Set entity = entities(i)
+        If Not entity Is Nothing Then
+            Set body = Nothing
+            If TypeOf entity Is SldWorks.Face2 Then
+                Set face = entity
+                Set body = face.GetBody
+            ElseIf TypeOf entity Is SldWorks.Edge Then
+                Set body = CallByName(entity, "GetBody", VbMethod)
+            End If
+            If Not body Is Nothing Then
+                If StrComp(body.Name, name, vbTextCompare) = 0 Then
+                    SourceBalloonAttachedToBody = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+Failed:
+End Function
+
+Private Function TryDeleteSourceNote(ByVal note As SldWorks.Note) As Boolean
+    Dim annotation As SldWorks.Annotation
+    On Error GoTo Failed
+    If note Is Nothing Then Exit Function
+    Set annotation = note.GetAnnotation
+    If annotation Is Nothing Then Exit Function
+    drawingModel.ClearSelection2 True
+    If annotation.Select3(False, Nothing) = False Then Exit Function
+    If drawingModel.SelectionManager.GetSelectedObjectCount2(-1) <> 1 Then Exit Function
+    TryDeleteSourceNote = drawingModel.Extension.DeleteSelection2(0)
+Failed:
+End Function
+
+Private Function CleanupSourcePositions() As String
+    Dim i As Long, note As SldWorks.Note
+    On Error GoTo Failed
+    If madeSourceNotes Is Nothing Then Exit Function
+    For i = madeSourceNotes.Count To 1 Step -1
+        Set note = madeSourceNotes(i)
+        If TryDeleteSourceNote(note) Then
+            madeSourceNotes.Remove i
+        Else
+            CleanupSourcePositions = CleanupSourcePositions & " Не удалена новая позиция исходного вида."
+        End If
+    Next i
+    Exit Function
+Failed:
+    CleanupSourcePositions = CleanupSourcePositions & " Ошибка очистки новых позиций исходного вида: " & Err.Description
+End Function
+
+Private Function TryAddSourcePosition(ByVal view As SldWorks.View, ByVal face As SldWorks.Face2, ByVal name As String, _
+                                      ByVal expectedItem As String, ByVal x As Double, ByVal y As Double, ByRef warning As String) As Boolean
+    Dim entity As SldWorks.Entity, manager As SldWorks.SelectionMgr, data As SldWorks.SelectData
+    Dim options As SldWorks.BalloonOptions, actualOptions As SldWorks.BalloonOptions, note As SldWorks.Note
+    Dim annotation As SldWorks.Annotation, item As String, position As Variant, registered As Boolean, errorText As String
+    On Error GoTo Failed
+    MarkStage "Позиция экземпляра на исходном виде"
+    Set entity = face
+    Set manager = drawingModel.SelectionManager
+    If manager Is Nothing Then Fail "Нет менеджера выбора для исходного вида."
+    Set data = manager.CreateSelectData
+    If data Is Nothing Then Fail "Не создан контекст выбора исходного вида."
+    data.View = view
+    drawingModel.ClearSelection2 True
+    If entity.Select4(False, data) = False Then Fail "Не выбрана видимая грань экземпляра."
+    If manager.GetSelectedObjectCount2(-1) <> 1 Then Fail "Выбрана не одна грань экземпляра."
+    Set options = drawingModel.Extension.CreateBalloonOptions
+    If options Is Nothing Then Fail "Нет параметров позиции исходного вида."
+    options.Style = swBS_None
+    options.UpperTextContent = swBalloonTextItemNumber
+    options.ShowQuantity = False
+    options.QuantityOverride = False
+    Set note = drawingModel.Extension.InsertBOMBalloon2(options)
+    If note Is Nothing Then Fail "Не создана позиция исходного вида."
+    madeSourceNotes.Add note
+    registered = True
+    Set annotation = note.GetAnnotation
+    If annotation Is Nothing Then Fail "Нет аннотации новой позиции исходного вида."
+    If TryReadItemNumber(note, item, warning) = False Then Fail warning
+    If StrComp(item, expectedItem, vbBinaryCompare) <> 0 Then Fail "Номер не совпал с позицией вынесенной детали."
+    If SourceBalloonAttachedToBody(annotation, name) = False Then Fail "Не подтверждена привязка позиции к нужному экземпляру."
+    Set actualOptions = note.GetBalloonOptions
+    If actualOptions Is Nothing Then Fail "Не прочитаны параметры новой позиции."
+    If actualOptions.ShowQuantity Then Fail "Позиция исходного вида содержит количество."
+    ShowSourceLeader annotation
+    If annotation.SetPosition2(x, y, 0#) = False Then Fail "Не размещена позиция исходного вида."
+    position = annotation.GetPosition
+    If HasItems(position) = False Then Fail "Не прочитано положение новой позиции."
+    If LBound(position) <> 0 Or UBound(position) < 1 Then Fail "Некорректное положение новой позиции."
+    If Abs(CDbl(position(0)) - x) > 0.0001 Or Abs(CDbl(position(1)) - y) > 0.0001 Then Fail "Не подтверждено положение новой позиции."
+    If TryReadItemNumber(note, item, warning) = False Then Fail warning
+    If StrComp(item, expectedItem, vbBinaryCompare) <> 0 Then Fail "Номер изменился после размещения позиции."
+    If SourceBalloonAttachedToBody(annotation, name) = False Then Fail "Потеряна привязка позиции после размещения."
+    Set actualOptions = note.GetBalloonOptions
+    If actualOptions Is Nothing Then Fail "Не подтверждены итоговые параметры позиции."
+    If actualOptions.Style <> swBS_None Then Fail "Позиция исходного вида имеет рамку."
+    If actualOptions.ShowQuantity Then Fail "Позиция исходного вида содержит количество."
+    If annotation.GetLeaderStyle = swNO_LEADER Then Fail "У позиции исходного вида пропала линия-выноска."
+    WriteLog "Позиция исходного вида: тело=[" & name & "]; номер=[" & item & "]; X=" & CStr(x) & "; Y=" & CStr(y)
+    drawingModel.ClearSelection2 True
+    TryAddSourcePosition = True
+    Exit Function
+Failed:
+    errorText = CStr(Err.Number) & ": " & Err.Description
+    warning = errorText
+    On Error GoTo 0
+    If registered Then
+        If TryDeleteSourceNote(note) Then
+            madeSourceNotes.Remove madeSourceNotes.Count
+        Else
+            Fail "Не удалена неподтвержденная позиция исходного вида. " & errorText
+        End If
+    End If
+    drawingModel.ClearSelection2 True
 End Function
 
 Private Sub HidePositionLeader(ByVal annotation As SldWorks.Annotation, ByVal note As SldWorks.Note)
