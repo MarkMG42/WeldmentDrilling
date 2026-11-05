@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R29_SOURCE_POSITIONS_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R30_DETAIL_POSITION_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -20,6 +20,7 @@ Private Const BREAK_END_CLEARANCE As Double = 0.015
 Private Const DIM_BASE_OFFSET As Double = 0.007
 Private Const DIM_LINE_STEP As Double = 0.006
 Private Const BALLOON_LEFT_OFFSET As Double = 0.02
+Private Const DETAIL_BALLOON_OFFSET As Double = 0.008
 Private Const SIDE_MARGIN As Double = 0.02
 Private Const BOTTOM_MARGIN As Double = 0.04
 Private Const EPS As Double = 0.0000001
@@ -99,6 +100,7 @@ Public Sub start()
     Dim props As Variant, i As Long, completed As Long, icon As VbMsgBoxStyle, outside As Long
     Dim runStart As Single, phaseStart As Single
     Dim hadFailure As Boolean, runCompleted As Boolean
+    Dim finishFailure As Boolean, hasPartialErrors As Boolean, hasOtherWarnings As Boolean
     On Error GoTo Failed
     Set madeViews = New Collection
     Set madeBodyNames = New Collection
@@ -280,11 +282,13 @@ Finished:
     cleanup = RestoreConfiguration()
     If Len(cleanup) > 0 Then
         message = message & vbCrLf & cleanup
+        finishFailure = True
         icon = vbExclamation
     End If
     cleanup = RestoreDrawingContext()
     If Len(cleanup) > 0 Then
         message = message & vbCrLf & cleanup
+        finishFailure = True
         icon = vbExclamation
     End If
     On Error Resume Next
@@ -295,6 +299,7 @@ Finished:
     End If
     If Err.Number <> 0 Then
         message = message & vbCrLf & "Ошибка очистки или перерисовки: " & CStr(Err.Number) & ": " & Err.Description
+        finishFailure = True
         icon = vbExclamation
         Err.Clear
     End If
@@ -302,15 +307,28 @@ Finished:
     If Len(logPath) > 0 Then message = message & vbCrLf & "Журнал: " & logPath
     WriteLog "Итог: " & Replace(message, vbCrLf, " | ")
     If Len(logPath) = 0 Then Debug.Print "Предупреждение: файл журнала недоступен."
-    If hadFailure Then
+    If runCompleted Then
+        hasPartialErrors = completed = 0 Or dimensionsFailed > 0 Or sourceBalloonsFailed > 0 Or _
+                           skipped.Count > 0 Or finishFailure
+        If madeTableReady And balloonsFailed > 0 Then hasPartialErrors = True
+        hasOtherWarnings = Len(tableWarning) > 0 Or dimensionWarnings.Count > 0 Or breakWarnings.Count > 0 Or _
+                           balloonWarnings.Count > 0 Or orientationWarnings.Count > 0 Or balloonsFailed > 0 Or _
+                           pendingPaste Or Len(logPath) = 0 Or outside < 0
+    End If
+    If hadFailure Or finishFailure Then
         prompt = "Макрос завершён с ошибкой."
         icon = vbExclamation
     ElseIf runCompleted = False Then
         prompt = "Макрос не выполнен: нет подходящих тел."
         icon = vbExclamation
-    ElseIf icon = vbExclamation Or completed = 0 Or dimensionsFailed > 0 Or balloonsFailed > 0 Or _
-           dimensionsOutside > 0 Or outside <> 0 Or pendingPaste Or Len(logPath) = 0 Then
-        prompt = "Макрос завершён с ошибками или предупреждениями."
+    ElseIf hasPartialErrors Then
+        prompt = "Макрос завершён с ошибками."
+        icon = vbExclamation
+    ElseIf hasOtherWarnings = False And (dimensionsOutside > 0 Or outside > 0) Then
+        prompt = "Выполнено; часть оформления за полями листа."
+        icon = vbExclamation
+    ElseIf icon = vbExclamation Or hasOtherWarnings Or dimensionsOutside > 0 Or outside <> 0 Then
+        prompt = "Макрос выполнен с предупреждениями."
         icon = vbExclamation
     Else
         prompt = "Макрос выполнен успешно."
@@ -1414,6 +1432,7 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
     Dim face As SldWorks.Face2, manager As SldWorks.SelectionMgr
     Dim holes As Long, area As Double, x As Double, y As Double, number As Long
     Dim capturedLeaderStyle As Long, leaderStyleCaptured As Boolean
+    Dim viewPosition As Variant, broken As Boolean, originalText As String
     On Error GoTo Failed
     MarkStage "Создание связанной позиции и количества"
     MarkStage "Поиск грани для позиции"
@@ -1441,6 +1460,11 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
     options.QuantityPlacement = 3
     options.QuantityDenotationText = "шт"
     options.QuantityOverride = False
+    outline = ReadOutline(view)
+    viewPosition = ReadPosition(view)
+    broken = view.IsBroken
+    WriteLog "Основа позиции: IsBroken=" & CStr(broken) & "; outline=" & CStr(outline(0)) & "," & CStr(outline(1)) & _
+             "," & CStr(outline(2)) & "," & CStr(outline(3)) & "; viewPosition=" & CStr(viewPosition(0)) & "," & CStr(viewPosition(1))
     MarkStage "Вставка позиции"
     Set note = drawingModel.Extension.InsertBOMBalloon2(options)
     If note Is Nothing Then Fail "Не удалось создать позицию списка вырезов."
@@ -1453,21 +1477,29 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
     If actualOptions Is Nothing Then Fail "Не прочитаны параметры созданной позиции."
     If actualOptions.ShowQuantity = False Or actualOptions.QuantityOverride Then _
         Fail "Созданная позиция не связана с количеством списка вырезов."
-    MarkStage "Размещение позиции"
-    outline = ReadOutline(view)
-    x = CDbl(outline(0)) - BALLOON_LEFT_OFFSET
+    originalText = note.GetText
+    If Len(Trim$(originalText)) = 0 Then Fail "Позиция не показывает номер из списка вырезов."
+    leaderStyleCaptured = TryCaptureSourceLeaderStyle(annotation, capturedLeaderStyle)
+    HidePositionLeader annotation, note
+    MarkStage "Окончательное размещение позиции"
+    x = CDbl(outline(0)) - DETAIL_BALLOON_OFFSET
     y = (CDbl(outline(1)) + CDbl(outline(3))) / 2#
     If annotation.SetPosition2(x, y, 0#) = False Then Fail "Не установлено положение позиции слева от детали."
     MarkStage "Проверка позиции"
     position = annotation.GetPosition
     If HasItems(position) = False Then Fail "Позиция не вернула координаты."
+    If LBound(position) <> 0 Or UBound(position) < 1 Then Fail "Некорректные координаты позиции."
     If Abs(CDbl(position(0)) - x) > 0.0001 Or Abs(CDbl(position(1)) - y) > 0.0001 Then _
         Fail "Не подтверждено положение позиции после размещения."
-    MarkStage "Проверка текста позиции"
-    If Len(Trim$(note.GetText)) = 0 Then Fail "Позиция не показывает номер из списка вырезов."
-    leaderStyleCaptured = TryCaptureSourceLeaderStyle(annotation, capturedLeaderStyle)
-    HidePositionLeader annotation, note
-    WriteLog "Позиция: тело=[" & currentBody & "]; текст=[" & note.GetText & "]; X=" & CStr(x) & "; Y=" & CStr(y) & "; количество включено"
+    If note.IsBomBalloon = False Then Fail "Позиция потеряла связь со списком вырезов."
+    Set actualOptions = note.GetBalloonOptions
+    If actualOptions Is Nothing Then Fail "Не подтверждены окончательные параметры позиции."
+    If actualOptions.UpperTextContent <> swBalloonTextItemNumber Then Fail "Текст позиции не связан с номером из списка вырезов."
+    If actualOptions.ShowQuantity = False Or actualOptions.QuantityOverride Then Fail "Позиция потеряла связь с количеством списка вырезов."
+    If StrComp(note.GetText, originalText, vbBinaryCompare) <> 0 Then Fail "Текст позиции изменился при окончательном размещении."
+    WriteLog "Позиция: тело=[" & currentBody & "]; текст=[" & note.GetText & "]; X=" & CStr(position(0)) & _
+             "; Y=" & CStr(position(1)) & "; отступ якоря от outline=" & CStr(CDbl(outline(0)) - CDbl(position(0))) & _
+             "; IsBroken=" & CStr(broken) & "; количество включено"
     drawingModel.ClearSelection2 True
     If leaderStyleCaptured Then
         sourceLeaderStyle = capturedLeaderStyle
