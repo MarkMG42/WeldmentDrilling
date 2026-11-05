@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R36_ROUND_OPENINGS_ONLY_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R37_OUTER_WALL_FILTER_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -879,6 +879,32 @@ Private Function OpeningDot(ByVal first As Variant, ByVal second As Variant) As 
     OpeningDot = CDbl(first(0)) * CDbl(second(0)) + CDbl(first(1)) * CDbl(second(1)) + CDbl(first(2)) * CDbl(second(2))
 End Function
 
+Private Function OpeningPlaneAtBodyLimit(ByVal offset As Double, ByVal minimum As Double, ByVal maximum As Double) As Boolean
+    OpeningPlaneAtBodyLimit = (Abs(offset - minimum) <= OPENING_FILTER_TOL Or Abs(offset - maximum) <= OPENING_FILTER_TOL)
+End Function
+
+Private Function OpeningFaceIsExterior(ByVal body As SldWorks.Body2, ByVal face As SldWorks.Face2, ByVal normal As Variant) As Boolean
+    Dim box As Variant, point As Variant, low As Variant, high As Variant
+    Dim x As Double, y As Double, z As Double, minimum As Double, maximum As Double
+    box = face.GetBox
+    If HasItems(box) = False Then Fail "Нет границ проверяемой стенки."
+    point = face.GetClosestPointOn((CDbl(box(0)) + CDbl(box(3))) / 2#, _
+                                  (CDbl(box(1)) + CDbl(box(4))) / 2#, _
+                                  (CDbl(box(2)) + CDbl(box(5))) / 2#)
+    If HasItems(point) = False Then Fail "Не определено положение стенки."
+    If body.GetExtremePoint(CDbl(normal(0)), CDbl(normal(1)), CDbl(normal(2)), x, y, z) = False Then _
+        Fail "Не определена наружная граница тела."
+    high = Array(x, y, z)
+    If body.GetExtremePoint(-CDbl(normal(0)), -CDbl(normal(1)), -CDbl(normal(2)), x, y, z) = False Then _
+        Fail "Не определена противоположная граница тела."
+    low = Array(x, y, z)
+    minimum = OpeningDot(low, normal)
+    maximum = OpeningDot(high, normal)
+    ' A bore wall lies strictly between the two support planes of the solid.
+    ' Use both limits so the answer does not depend on the normal's orientation.
+    OpeningFaceIsExterior = OpeningPlaneAtBodyLimit(OpeningDot(point, normal), minimum, maximum)
+End Function
+
 Private Function BodyHasOnlyRoundOpenings(ByVal body As SldWorks.Body2, ByRef reason As String) As Boolean
     Dim face As SldWorks.Face2, surface As SldWorks.Surface, boundary As SldWorks.Loop2
     Dim axis As Variant, normal As Variant, cylinder As Variant
@@ -893,12 +919,17 @@ Private Function BodyHasOnlyRoundOpenings(ByVal body As SldWorks.Body2, ByRef re
         lateralCylinder = False
         If surface.IsPlane Then
             normal = face.Normal
-            lateralPlane = (Abs(OpeningDot(normal, axis)) <= OPENING_SIDE_DOT_TOL)
+            If Abs(OpeningDot(normal, axis)) <= OPENING_SIDE_DOT_TOL Then
+                lateralPlane = OpeningFaceIsExterior(body, face, normal)
+            End If
         ElseIf surface.IsCylinder Then
-            cylinder = surface.CylinderParams
-            lateralCylinder = (Abs(Abs(OpeningDot(Array(cylinder(3), cylinder(4), cylinder(5)), axis)) - 1#) <= OPENING_SIDE_DOT_TOL)
+            ' Interior bore/corner surfaces can have broken contours from valid round drillings.
+            If face.FaceInSurfaceSense = False Then
+                cylinder = surface.CylinderParams
+                lateralCylinder = (Abs(Abs(OpeningDot(Array(cylinder(3), cylinder(4), cylinder(5)), axis)) - 1#) <= OPENING_SIDE_DOT_TOL)
+            End If
         End If
-        ' End faces (including mitred ends and the hollow profile bore) are not wall openings.
+        ' Inspect exterior walls only; end faces and surfaces inside the hollow profile are excluded.
         If lateralPlane Or lateralCylinder Then
             sawWall = True
             Set boundary = face.GetFirstLoop
@@ -909,7 +940,7 @@ Private Function BodyHasOnlyRoundOpenings(ByVal body As SldWorks.Body2, ByRef re
                     End If
                 Else
                     If IsRoundOpening(boundary) = False Then
-                        reason = "найдено некруглое отверстие в стенке"
+                        reason = "найдено некруглое отверстие на наружной стенке"
                         Exit Function
                     End If
                 End If
@@ -959,7 +990,7 @@ Private Function OpeningOuterContourIsConvex(ByVal boundary As SldWorks.Loop2, B
         Next j
     Next i
     If OpeningContourHasNotch(points, segments, normal) Then
-        reason = "найден открытый паз или вырез от края стенки"
+        reason = "найден открытый паз или вырез от края наружной стенки"
         Exit Function
     End If
     OpeningOuterContourIsConvex = True
@@ -1000,6 +1031,10 @@ End Function
 
 Public Sub TestOpeningContours()
     Dim points As Collection, segments As Collection, polygon As Variant, i As Long
+    If OpeningPlaneAtBodyLimit(0.025, -0.025, 0.025) = False Then Fail "Filter: exterior wall not recognized"
+    If OpeningPlaneAtBodyLimit(-0.025, -0.025, 0.025) = False Then Fail "Filter: opposite exterior wall not recognized"
+    If OpeningPlaneAtBodyLimit(0.022, -0.025, 0.025) Then Fail "Filter: interior bore wall treated as exterior"
+    If OpeningPlaneAtBodyLimit(-0.022, -0.025, 0.025) Then Fail "Filter: opposite bore wall treated as exterior"
     Set points = New Collection
     Set segments = New Collection
     polygon = Array(Array(0#, 0#, 0#), Array(0.1, 0#, 0#), Array(0.1, 0.02, 0#), Array(0#, 0.02, 0#))
