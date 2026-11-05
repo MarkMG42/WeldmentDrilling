@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R27_PROJECTED_SPACING_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R28_COMPACT_STATUS_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -10,7 +10,7 @@ Private Const HOLES_LEFT As Boolean = True
 Private Const HOLE_SIDE_TOLERANCE As Double = 0.0001
 Private Const ALLOW_WORKSPACE_LAYOUT As Boolean = True
 Private Const DETAIL_SCALE As Double = 0.2
-Private Const GAP As Double = 0.0025
+Private Const GAP As Double = 0.002
 Private Const VERBOSE_BREAK_GEOMETRY As Boolean = False
 Private Const BREAK_MODEL_THRESHOLD As Double = 1.2
 Private Const BREAK_MAX_WIDTH As Double = 0.15
@@ -92,6 +92,7 @@ Public Sub start()
     Dim bodies As Collection, cursorY As Double, width As Double, height As Double
     Dim props As Variant, i As Long, completed As Long, icon As VbMsgBoxStyle, outside As Long
     Dim runStart As Single, phaseStart As Single
+    Dim hadFailure As Boolean, runCompleted As Boolean
     On Error GoTo Failed
     Set madeViews = New Collection
     Set madeBodyNames = New Collection
@@ -164,13 +165,6 @@ Public Sub start()
     If width <= 2# * SIDE_MARGIN Or height <= BOTTOM_MARGIN Then Fail "Неверные размеры листа."
     MarkStage "Начало компоновки: первый вид слева, остальные справа"
     cursorY = height - SIDE_MARGIN
-    If MsgBox(BUILD_ID & vbCrLf & "Проверить позиций: " & CStr(bodies.Count) & _
-              ". Масштаб 1:" & CStr(1# / DETAIL_SCALE) & vbCrLf & _
-              "Размещение за полями листа разрешено: " & CStr(ALLOW_WORKSPACE_LAYOUT) & _
-              ". Перед печатью потребуется компоновка. Продолжить?", vbQuestion + vbYesNo) <> vbYes Then
-        message = "Отменено."
-        GoTo Finished
-    End If
     runStart = Timer
     phaseStart = runStart
     tableTemplate = TryResolveTableTemplate(tableWarning)
@@ -194,6 +188,7 @@ Public Sub start()
     If ADD_BALLOONS And completed > 0 Then AddPositions
     WriteLog "Время: позиции=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с; всего=" & _
              Format$(ElapsedSeconds(runStart), "0.00") & " с"
+    runCompleted = True
     message = "Создано видов: " & CStr(completed) & "; пропущено позиций: " & CStr(skipped.Count) & "."
     If AUTO_DIMENSIONS Then message = message & vbCrLf & "Размеры: обработано видов=" & CStr(dimensionsCompleted) & "; не обработано=" & CStr(dimensionsFailed) & "."
     If AUTO_DIMENSIONS Then message = message & vbCrLf & "Разрывов длинных видов=" & CStr(breaksCompleted) & "; пропущено=" & CStr(breakWarnings.Count) & "."
@@ -202,6 +197,7 @@ Public Sub start()
         icon = vbExclamation
         message = message & vbCrLf & "Таблица списка вырезов не создана: " & tableWarning
     End If
+    If dimensionsOutside > 0 Then icon = vbExclamation
     If dimensionsOutside > 0 Then message = message & vbCrLf & "Оформление за полями: " & CStr(dimensionsOutside) & ". Требуется компоновка."
     If dimensionWarnings.Count > 0 Then
         icon = vbExclamation
@@ -250,6 +246,7 @@ Public Sub start()
     message = message & vbCrLf & "Документы не сохранены. Проверьте результат перед сохранением."
     GoTo Finished
 Failed:
+    hadFailure = True
     errorText = DescribeError(Err.Number, Err.Source, Err.Description, Erl)
     WriteLog errorText
     cleanup = CleanupSince(0)
@@ -260,20 +257,44 @@ Failed:
     icon = vbExclamation
 Finished:
     cleanup = RestoreConfiguration()
-    If Len(cleanup) > 0 Then message = message & vbCrLf & cleanup
+    If Len(cleanup) > 0 Then
+        message = message & vbCrLf & cleanup
+        icon = vbExclamation
+    End If
     cleanup = RestoreDrawingContext()
-    If Len(cleanup) > 0 Then message = message & vbCrLf & cleanup
+    If Len(cleanup) > 0 Then
+        message = message & vbCrLf & cleanup
+        icon = vbExclamation
+    End If
     On Error Resume Next
+    Err.Clear
     If Not drawingModel Is Nothing Then
         drawingModel.ClearSelection2 True
         drawingModel.GraphicsRedraw2
     End If
+    If Err.Number <> 0 Then
+        message = message & vbCrLf & "Ошибка очистки или перерисовки: " & CStr(Err.Number) & ": " & Err.Description
+        icon = vbExclamation
+        Err.Clear
+    End If
     On Error GoTo 0
     If Len(logPath) > 0 Then message = message & vbCrLf & "Журнал: " & logPath
-    If icon = 0 Then icon = vbInformation
     WriteLog "Итог: " & Replace(message, vbCrLf, " | ")
-    prompt = BUILD_ID & vbCrLf & message
-    If Len(prompt) > 950 Then prompt = Left$(prompt, 700) & vbCrLf & "Полный отчёт в журнале: " & logPath
+    If Len(logPath) = 0 Then Debug.Print "Предупреждение: файл журнала недоступен."
+    If hadFailure Then
+        prompt = "Макрос завершён с ошибкой."
+        icon = vbExclamation
+    ElseIf runCompleted = False Then
+        prompt = "Макрос не выполнен: нет подходящих тел."
+        icon = vbExclamation
+    ElseIf icon = vbExclamation Or completed = 0 Or dimensionsFailed > 0 Or balloonsFailed > 0 Or _
+           dimensionsOutside > 0 Or outside <> 0 Or pendingPaste Or Len(logPath) = 0 Then
+        prompt = "Макрос завершён с ошибками или предупреждениями."
+        icon = vbExclamation
+    Else
+        prompt = "Макрос выполнен успешно."
+        icon = vbInformation
+    End If
     MsgBox prompt, icon, "Сверловка"
 End Sub
 
@@ -460,14 +481,6 @@ Private Function ResolveTableTemplate() As String
             Exit Function
         End If
     Next language
-    candidate = InputBox("Шаблон списка вырезов недоступен. Укажите полный путь к файлу .sldwldtbt. " & _
-                         "Файл .sldbomtbt относится к другой таблице.", _
-                         "Шаблон списка вырезов", TABLE_TEMPLATE)
-    candidate = NormalizeTablePath(candidate)
-    If TableFileExists(candidate) Then
-        ResolveTableTemplate = candidate
-        Exit Function
-    End If
     Fail "Не найден доступный шаблон .sldwldtbt; таблица не создана."
 End Function
 
@@ -2580,7 +2593,7 @@ Private Function NdDimensionEnvelope(ByVal created As Collection, ByRef bounds A
         If point(1) > maxY Then maxY = point(1)
     Next i
     ' Anchor positions plus allowance, not exact glyph bounds.
-    NdDimensionEnvelope = Array(created.Count, minX - 0.015, minY - 0.01, maxX + 0.015, maxY + 0.01)
+    NdDimensionEnvelope = Array(created.Count, minX - 0.015, minY - 0.0075, maxX + 0.015, maxY + 0.0075)
 End Function
 
 Private Function NdDeleteDimension(ByVal display As SldWorks.DisplayDimension) As Boolean
