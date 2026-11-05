@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R25_EXPERIMENT_REBUILD_20261104"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R26_EXPERIMENT_PLACEMENT_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -1149,7 +1149,6 @@ Private Sub PlaceDetail(ByVal view As SldWorks.View, ByRef cursorY As Double, By
     End If
     position(1) = position(1) + cursorY - outline(3)
     view.Position = position
-    drawingModel.EditRebuild3
     outline = ReadOutline(view)
     If Abs(outline(3) - cursorY) > 0.0001 Then Fail "SOLIDWORKS не применил верхнее положение вида."
     If placeLeft Then
@@ -1234,7 +1233,6 @@ Private Sub PlaceDimensionBox(ByVal view As SldWorks.View, ByVal box As Variant,
     position(1) = position(1) + dy
     If Abs(dx) > EPS Or Abs(dy) > EPS Then
         view.Position = position
-        drawingModel.EditRebuild3
     End If
     actual = ReadPosition(view)
     If Abs(actual(0) - position(0)) > 0.0001 Or Abs(actual(1) - position(1)) > 0.0001 Then Fail "Не применена компоновка вида с размерами."
@@ -1425,12 +1423,11 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
     x = CDbl(outline(0)) - BALLOON_LEFT_OFFSET
     y = (CDbl(outline(1)) + CDbl(outline(3))) / 2#
     If annotation.SetPosition2(x, y, 0#) = False Then Fail "Не установлено положение позиции слева от детали."
-    MarkStage "Перестроение позиции"
-    drawingModel.EditRebuild3
+    MarkStage "Проверка позиции"
     position = annotation.GetPosition
     If HasItems(position) = False Then Fail "Позиция не вернула координаты."
     If Abs(CDbl(position(0)) - x) > 0.0001 Or Abs(CDbl(position(1)) - y) > 0.0001 Then _
-        Fail "Позиция сместилась после перестроения."
+        Fail "Не подтверждено положение позиции после размещения."
     MarkStage "Проверка текста позиции"
     If Len(Trim$(note.GetText)) = 0 Then Fail "Позиция не показывает номер из списка вырезов."
     HidePositionLeader annotation, note
@@ -1471,7 +1468,6 @@ Private Sub HidePositionLeader(ByVal annotation As SldWorks.Annotation, ByVal no
     changed = True
     status = annotation.SetLeader3(swNO_LEADER, oldSide, oldSmart, oldPerpendicular, oldAround, oldDashed)
     If status <> 0 Then Fail "SetLeader3: код " & CStr(status)
-    drawingModel.EditRebuild3
     If annotation.GetLeaderStyle <> swNO_LEADER Then Fail "Линия позиции не скрыта."
     If note.IsBomBalloon = False Then Fail "Позиция перестала быть BOM-выноской."
     Set options = note.GetBalloonOptions
