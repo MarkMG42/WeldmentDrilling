@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R37_OUTER_WALL_FILTER_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R38_TOPOLOGY_CONTOURS_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -960,7 +960,8 @@ Private Function OpeningOuterContourIsConvex(ByVal boundary As SldWorks.Loop2, B
                                             ByRef reason As String) As Boolean
     Dim edges As Variant, edge As SldWorks.Edge, curve As SldWorks.Curve, parameters As Object
     Dim points As Collection, segments As Collection, point As Variant, i As Long, j As Long
-    Dim divisions As Long, firstIndex As Long, parameter As Double
+    Dim firstVertex As SldWorks.Vertex, lastVertex As SldWorks.Vertex, firstPoint As Variant, lastPoint As Variant
+    Dim firstIndex As Long, parameter As Double
     Set points = New Collection
     Set segments = New Collection
     edges = boundary.GetEdges
@@ -970,24 +971,33 @@ Private Function OpeningOuterContourIsConvex(ByVal boundary As SldWorks.Loop2, B
         If edge Is Nothing Then Fail "ѕустое ребро наружного контура."
         Set curve = edge.GetCurve
         If curve Is Nothing Then Fail "Ќет кривой наружного контура."
+        firstIndex = points.Count + 1
         If curve.IsLine Then
-            divisions = 1
+            ' Trimmed straight edges are defined by their BREP vertices. Do not reconstruct
+            ' them by evaluating the underlying curve with an edge parameter interval.
+            Set firstVertex = edge.GetStartVertex
+            Set lastVertex = edge.GetEndVertex
+            If firstVertex Is Nothing Or lastVertex Is Nothing Then Fail "Ќет вершин пр€мого ребра контура."
+            firstPoint = firstVertex.GetPoint
+            lastPoint = lastVertex.GetPoint
+            If HasItems(firstPoint) = False Or HasItems(lastPoint) = False Then Fail "Ќет координат вершин контура."
+            points.Add Array(CDbl(firstPoint(0)), CDbl(firstPoint(1)), CDbl(firstPoint(2)))
+            points.Add Array(CDbl(lastPoint(0)), CDbl(lastPoint(1)), CDbl(lastPoint(2)))
+            segments.Add Array(firstIndex, firstIndex + 1)
         ElseIf curve.IsCircle Then
-            divisions = OPENING_ARC_SEGMENTS
+            Set parameters = edge.GetCurveParams3
+            If parameters Is Nothing Then Fail "Ќет параметров дуги контура."
+            For j = 0 To OPENING_ARC_SEGMENTS
+                parameter = parameters.UMinValue + (parameters.UMaxValue - parameters.UMinValue) * CDbl(j) / CDbl(OPENING_ARC_SEGMENTS)
+                point = edge.Evaluate2(parameter, 0)
+                If HasItems(point) = False Then Fail "Ќе вычислена точка дуги контура."
+                points.Add Array(CDbl(point(0)), CDbl(point(1)), CDbl(point(2)))
+                If j > 0 Then segments.Add Array(firstIndex + j - 1, firstIndex + j)
+            Next j
         Else
             reason = "найден некруглый криволинейный вырез на краю стенки"
             Exit Function
         End If
-        Set parameters = edge.GetCurveParams3
-        If parameters Is Nothing Then Fail "Ќет параметров ребра контура."
-        firstIndex = points.Count + 1
-        For j = 0 To divisions
-            parameter = parameters.UMinValue + (parameters.UMaxValue - parameters.UMinValue) * CDbl(j) / CDbl(divisions)
-            point = curve.Evaluate2(parameter, 0)
-            If HasItems(point) = False Then Fail "Ќе вычислена точка наружного контура."
-            points.Add Array(CDbl(point(0)), CDbl(point(1)), CDbl(point(2)))
-            If j > 0 Then segments.Add Array(firstIndex + j - 1, firstIndex + j)
-        Next j
     Next i
     If OpeningContourHasNotch(points, segments, normal) Then
         reason = "найден открытый паз или вырез от кра€ наружной стенки"
