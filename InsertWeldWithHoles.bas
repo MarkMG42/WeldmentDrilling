@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R32_ORDERED_CALLOUTS_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R33_BODY_CONTEXT_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -1563,11 +1563,17 @@ Unknown:
     CountOutsideLayout = -1
 End Function
 
-Private Function ViewCutListItem(ByVal view As SldWorks.View) As String
+Private Function ViewCutListItem(ByVal view As SldWorks.View, ByVal bodyName As String) As String
     Dim face As SldWorks.Face2, entity As SldWorks.Entity, data As SldWorks.SelectData
     Dim options As SldWorks.BalloonOptions, note As SldWorks.Note
     Dim holes As Long, area As Double, item As String, warning As String, errorText As String
     On Error GoTo Failed
+    ' Each lookup must use this view's body, not the last body processed by ProcessBody.
+    currentBody = bodyName
+    currentView = view.GetName2
+    currentDirection = 0
+    If Len(bodyName) = 0 Then Fail "Ќе задано тело дл€ определени€ строки списка вырезов."
+    MarkStage "ќпределение строки списка вырезов дл€ тела [" & bodyName & "]"
     Set face = FindVisibleHoleFace(view, holes, area)
     If face Is Nothing Then Fail "Ќе найдена грань дл€ определени€ строки списка вырезов."
     Set entity = face
@@ -1680,7 +1686,7 @@ Private Sub AlignDetailsWithCutList()
     ' A native temporary balloon gives the actual row association, independent of profile names.
     For i = 1 To madeViews.Count
         Set view = madeViews(i)
-        item = ViewCutListItem(view)
+        item = ViewCutListItem(view, CStr(madeBodyNames(i)))
         If itemRows.Exists(item) = False Then Fail "Ќомер вида не найден в таблице: " & item
         originalRow = CLng(itemRows(item))
         If selectedRows.Exists(CStr(originalRow)) Then Fail "ƒва вида соответствуют одной строке таблицы."
@@ -1723,7 +1729,7 @@ Private Sub AlignDetailsWithCutList()
         If Trim$(table.DisplayedText(firstRow + i - 1, itemColumn)) <> CStr(i) Then _
             Fail "Ќе подтверждена сквозна€ нумераци€ таблицы от 1."
         Set view = views(i)
-        If ViewCutListItem(view) <> CStr(i) Then _
+        If ViewCutListItem(view, CStr(names(i))) <> CStr(i) Then _
             Fail "—в€занный номер вида не совпал со строкой таблицы: " & CStr(i)
     Next i
     Set madeViews = views
