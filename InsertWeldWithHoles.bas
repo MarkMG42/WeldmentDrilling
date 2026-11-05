@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R35_CHANNEL_LENGTH_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R36_ROUND_OPENINGS_ONLY_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -26,6 +26,9 @@ Private Const SIDE_MARGIN As Double = 0.02
 Private Const BOTTOM_MARGIN As Double = 0.04
 Private Const EPS As Double = 0.0000001
 Private Const VIEW_PREFIX As String = "DRILL_"
+Private Const OPENING_FILTER_TOL As Double = 0.000001
+Private Const OPENING_SIDE_DOT_TOL As Double = 0.0001
+Private Const OPENING_ARC_SEGMENTS As Long = 16
 Private Const TABLE_TEMPLATE As String = "\\192.168.1.14\SolidWorks\Библиотека Solid Works НОВАЯ\Шаблоны\Сварные конструкции.sldwldtbt"
 Private app As SldWorks.SldWorks
 Private drawingModel As SldWorks.ModelDoc2
@@ -54,6 +57,7 @@ Private balloonWarnings As Collection
 Private dimensionsCompleted As Long
 Private dimensionsFailed As Long
 Private dimensionsOutside As Long
+Private excludedByOpeningFilter As Long
 Private breaksCompleted As Long
 Private balloonsCompleted As Long
 Private balloonsFailed As Long
@@ -122,6 +126,7 @@ Public Sub start()
     dimensionsCompleted = 0
     dimensionsFailed = 0
     dimensionsOutside = 0
+    excludedByOpeningFilter = 0
     breaksCompleted = 0
     balloonsCompleted = 0
     balloonsFailed = 0
@@ -168,10 +173,10 @@ Public Sub start()
     Set visited = CreateObject("Scripting.Dictionary")
     MarkStage "Обновление списка вырезов"
     UpdateCutList
-    MarkStage "Отбор позиций с круглыми внутренними контурами"
+    MarkStage "Отбор деталей только с круглыми отверстиями, без открытых пазов"
     CollectBodies partModel.FirstFeature, bodies, False
     If bodies.Count = 0 Then
-        message = "В списке вырезов нет тел с круглыми внутренними контурами на плоских гранях."
+        message = "Нет деталей с круглыми отверстиями, прошедших проверку контуров. Причины пропуска см. в журнале."
         GoTo Finished
     End If
     MarkStage "Проверка ранее созданных видов"
@@ -230,6 +235,7 @@ Public Sub start()
              Format$(ElapsedSeconds(runStart), "0.00") & " с"
     runCompleted = True
     message = "Создано видов: " & CStr(completed) & "; пропущено позиций: " & CStr(skipped.Count) & "."
+    If excludedByOpeningFilter > 0 Then message = message & vbCrLf & "Исключено при проверке отверстий и пазов: " & CStr(excludedByOpeningFilter) & "."
     If AUTO_DIMENSIONS Then message = message & vbCrLf & "Размеры: обработано видов=" & CStr(dimensionsCompleted) & "; не обработано=" & CStr(dimensionsFailed) & "."
     If AUTO_DIMENSIONS Then message = message & vbCrLf & "Разрывов длинных видов=" & CStr(breaksCompleted) & "; пропущено=" & CStr(breakWarnings.Count) & "."
     If ADD_BALLOONS Then message = message & vbCrLf & "Позиции с количеством: создано=" & CStr(balloonsCompleted) & "; пропущено=" & CStr(balloonsFailed) & "."
@@ -764,6 +770,7 @@ End Sub
 Private Sub CollectBodies(ByVal feature As SldWorks.Feature, ByVal result As Collection, ByVal subLevel As Boolean)
     Dim folder As SldWorks.BodyFolder, values As Variant
     Dim body As SldWorks.Body2, face As SldWorks.Face2, i As Long
+    Dim representative As String, reason As String
     Do While Not feature Is Nothing
         If feature.GetTypeName2 = "CutListFolder" Then
             If visited.Exists(feature.Name) = False Then
@@ -772,16 +779,26 @@ Private Sub CollectBodies(ByVal feature As SldWorks.Feature, ByVal result As Col
                 If Not folder Is Nothing Then
                     values = folder.GetBodies
                     If HasItems(values) Then
+                        representative = ""
                         For i = LBound(values) To UBound(values)
                             Set body = values(i)
                             If Not body Is Nothing Then
                                 Set face = BestHoleFace(body)
                                 If Not face Is Nothing Then
-                                    result.Add body.Name
-                                    Exit For ' One representative per cut-list item, not per instance.
+                                    representative = body.Name
+                                    Exit For
                                 End If
                             End If
                         Next i
+                        If Len(representative) > 0 Then
+                            reason = ""
+                            If GroupHasOnlyRoundOpenings(values, reason) Then
+                                result.Add representative ' One representative per accepted cut-list item.
+                            Else
+                                excludedByOpeningFilter = excludedByOpeningFilter + 1
+                                WriteLog "Отбор: группа [" & feature.Name & "] пропущена: " & reason
+                            End If
+                        End If
                     End If
                 End If
             End If
@@ -794,6 +811,216 @@ Private Sub CollectBodies(ByVal feature As SldWorks.Feature, ByVal result As Col
             Set feature = feature.GetNextFeature
         End If
     Loop
+End Sub
+
+Private Function GroupHasOnlyRoundOpenings(ByVal bodies As Variant, ByRef reason As String) As Boolean
+    Dim body As SldWorks.Body2, i As Long, detail As String
+    On Error GoTo UnknownGeometry
+    For i = LBound(bodies) To UBound(bodies)
+        Set body = bodies(i)
+        If body Is Nothing Then Fail "Пустое тело в группе списка вырезов."
+        detail = ""
+        If BodyHasOnlyRoundOpenings(body, detail) = False Then
+            reason = "тело [" & body.Name & "]: " & detail
+            Exit Function
+        End If
+    Next i
+    GroupHasOnlyRoundOpenings = True
+    Exit Function
+UnknownGeometry:
+    reason = "не удалось проверить геометрию группы: " & Err.Description
+End Function
+
+Private Function OpeningBodyAxis(ByVal body As SldWorks.Body2) As Variant
+    Dim edges As Variant, edge As SldWorks.Edge, curve As SldWorks.Curve
+    Dim first As SldWorks.Vertex, last As SldWorks.Vertex, a As Variant, b As Variant
+    Dim direction As Variant, i As Long, dx As Double, dy As Double, dz As Double
+    Dim lengthSquared As Double, longestSquared As Double, length As Double
+    Dim ambiguous As Boolean, alignment As Double
+    ' Straight structural members: the longest straight BREP edge defines their length direction.
+    edges = body.GetEdges
+    If HasItems(edges) = False Then Fail "Нет рёбер для определения продольной оси."
+    For i = LBound(edges) To UBound(edges)
+        Set edge = edges(i)
+        If edge Is Nothing Then Fail "Пустое ребро тела."
+        Set curve = edge.GetCurve
+        If curve Is Nothing Then Fail "Не прочитана кривая ребра."
+        If curve.IsLine Then
+            Set first = edge.GetStartVertex
+            Set last = edge.GetEndVertex
+            If Not first Is Nothing And Not last Is Nothing Then
+                a = first.GetPoint
+                b = last.GetPoint
+                dx = CDbl(b(0)) - CDbl(a(0))
+                dy = CDbl(b(1)) - CDbl(a(1))
+                dz = CDbl(b(2)) - CDbl(a(2))
+                lengthSquared = dx * dx + dy * dy + dz * dz
+                If Sqr(lengthSquared) > Sqr(longestSquared) + OPENING_FILTER_TOL Then
+                    longestSquared = lengthSquared
+                    direction = Array(dx, dy, dz)
+                    ambiguous = False
+                ElseIf longestSquared > OPENING_FILTER_TOL * OPENING_FILTER_TOL Then
+                    If Abs(Sqr(lengthSquared) - Sqr(longestSquared)) <= OPENING_FILTER_TOL Then
+                        alignment = Abs(dx * CDbl(direction(0)) + dy * CDbl(direction(1)) + dz * CDbl(direction(2))) / longestSquared
+                        If Abs(alignment - 1#) > OPENING_SIDE_DOT_TOL Then ambiguous = True
+                    End If
+                End If
+            End If
+        End If
+    Next i
+    If longestSquared <= OPENING_FILTER_TOL * OPENING_FILTER_TOL Then _
+        Fail "Не определена продольная ось прямого профиля."
+    If ambiguous Then Fail "Неоднозначная продольная ось: одинаковые размеры по разным направлениям."
+    length = Sqr(longestSquared)
+    OpeningBodyAxis = Array(CDbl(direction(0)) / length, CDbl(direction(1)) / length, CDbl(direction(2)) / length)
+End Function
+
+Private Function OpeningDot(ByVal first As Variant, ByVal second As Variant) As Double
+    OpeningDot = CDbl(first(0)) * CDbl(second(0)) + CDbl(first(1)) * CDbl(second(1)) + CDbl(first(2)) * CDbl(second(2))
+End Function
+
+Private Function BodyHasOnlyRoundOpenings(ByVal body As SldWorks.Body2, ByRef reason As String) As Boolean
+    Dim face As SldWorks.Face2, surface As SldWorks.Surface, boundary As SldWorks.Loop2
+    Dim axis As Variant, normal As Variant, cylinder As Variant
+    Dim lateralPlane As Boolean, lateralCylinder As Boolean, sawWall As Boolean
+    On Error GoTo UnknownGeometry
+    axis = OpeningBodyAxis(body)
+    Set face = body.GetFirstFace
+    Do While Not face Is Nothing
+        Set surface = face.GetSurface
+        If surface Is Nothing Then Fail "Не прочитана поверхность грани."
+        lateralPlane = False
+        lateralCylinder = False
+        If surface.IsPlane Then
+            normal = face.Normal
+            lateralPlane = (Abs(OpeningDot(normal, axis)) <= OPENING_SIDE_DOT_TOL)
+        ElseIf surface.IsCylinder Then
+            cylinder = surface.CylinderParams
+            lateralCylinder = (Abs(Abs(OpeningDot(Array(cylinder(3), cylinder(4), cylinder(5)), axis)) - 1#) <= OPENING_SIDE_DOT_TOL)
+        End If
+        ' End faces (including mitred ends and the hollow profile bore) are not wall openings.
+        If lateralPlane Or lateralCylinder Then
+            sawWall = True
+            Set boundary = face.GetFirstLoop
+            Do While Not boundary Is Nothing
+                If boundary.IsOuter Then
+                    If lateralPlane Then
+                        If OpeningOuterContourIsConvex(boundary, normal, reason) = False Then Exit Function
+                    End If
+                Else
+                    If IsRoundOpening(boundary) = False Then
+                        reason = "найдено некруглое отверстие в стенке"
+                        Exit Function
+                    End If
+                End If
+                Set boundary = boundary.GetNext
+            Loop
+        End If
+        Set face = face.GetNextFace
+    Loop
+    If sawWall = False Then Fail "Не распознаны продольные стенки прямого профиля."
+    BodyHasOnlyRoundOpenings = True
+    Exit Function
+UnknownGeometry:
+    reason = "геометрия отверстий не подтверждена: " & Err.Description
+End Function
+
+Private Function OpeningOuterContourIsConvex(ByVal boundary As SldWorks.Loop2, ByVal normal As Variant, _
+                                            ByRef reason As String) As Boolean
+    Dim edges As Variant, edge As SldWorks.Edge, curve As SldWorks.Curve, parameters As Object
+    Dim points As Collection, segments As Collection, point As Variant, i As Long, j As Long
+    Dim divisions As Long, firstIndex As Long, parameter As Double
+    Set points = New Collection
+    Set segments = New Collection
+    edges = boundary.GetEdges
+    If HasItems(edges) = False Then Fail "Пустой наружный контур стенки."
+    For i = LBound(edges) To UBound(edges)
+        Set edge = edges(i)
+        If edge Is Nothing Then Fail "Пустое ребро наружного контура."
+        Set curve = edge.GetCurve
+        If curve Is Nothing Then Fail "Нет кривой наружного контура."
+        If curve.IsLine Then
+            divisions = 1
+        ElseIf curve.IsCircle Then
+            divisions = OPENING_ARC_SEGMENTS
+        Else
+            reason = "найден некруглый криволинейный вырез на краю стенки"
+            Exit Function
+        End If
+        Set parameters = edge.GetCurveParams3
+        If parameters Is Nothing Then Fail "Нет параметров ребра контура."
+        firstIndex = points.Count + 1
+        For j = 0 To divisions
+            parameter = parameters.UMinValue + (parameters.UMaxValue - parameters.UMinValue) * CDbl(j) / CDbl(divisions)
+            point = curve.Evaluate2(parameter, 0)
+            If HasItems(point) = False Then Fail "Не вычислена точка наружного контура."
+            points.Add Array(CDbl(point(0)), CDbl(point(1)), CDbl(point(2)))
+            If j > 0 Then segments.Add Array(firstIndex + j - 1, firstIndex + j)
+        Next j
+    Next i
+    If OpeningContourHasNotch(points, segments, normal) Then
+        reason = "найден открытый паз или вырез от края стенки"
+        Exit Function
+    End If
+    OpeningOuterContourIsConvex = True
+End Function
+
+Private Function OpeningContourHasNotch(ByVal points As Collection, ByVal segments As Collection, ByVal normal As Variant) As Boolean
+    Dim segment As Variant, a As Variant, b As Variant, point As Variant
+    Dim dx As Double, dy As Double, dz As Double, px As Double, py As Double, pz As Double
+    Dim length As Double, distance As Double, positive As Boolean, negative As Boolean
+    For Each segment In segments
+        a = points(CLng(segment(0)))
+        b = points(CLng(segment(1)))
+        dx = CDbl(b(0)) - CDbl(a(0))
+        dy = CDbl(b(1)) - CDbl(a(1))
+        dz = CDbl(b(2)) - CDbl(a(2))
+        length = Sqr(dx * dx + dy * dy + dz * dz)
+        If length > OPENING_FILTER_TOL Then
+            positive = False
+            negative = False
+            For Each point In points
+                px = CDbl(point(0)) - CDbl(a(0))
+                py = CDbl(point(1)) - CDbl(a(1))
+                pz = CDbl(point(2)) - CDbl(a(2))
+                distance = ((dy * pz - dz * py) * CDbl(normal(0)) + _
+                            (dz * px - dx * pz) * CDbl(normal(1)) + _
+                            (dx * py - dy * px) * CDbl(normal(2))) / length
+                If distance > OPENING_FILTER_TOL Then positive = True
+                If distance < -OPENING_FILTER_TOL Then negative = True
+                ' A convex outside boundary has all its other points on one side of each edge.
+                If positive And negative Then
+                    OpeningContourHasNotch = True
+                    Exit Function
+                End If
+            Next point
+        End If
+    Next segment
+End Function
+
+Public Sub TestOpeningContours()
+    Dim points As Collection, segments As Collection, polygon As Variant, i As Long
+    Set points = New Collection
+    Set segments = New Collection
+    polygon = Array(Array(0#, 0#, 0#), Array(0.1, 0#, 0#), Array(0.1, 0.02, 0#), Array(0#, 0.02, 0#))
+    For i = 0 To UBound(polygon)
+        points.Add polygon(i)
+        segments.Add Array(i + 1, ((i + 1) Mod (UBound(polygon) + 1)) + 1)
+    Next i
+    If OpeningContourHasNotch(points, segments, Array(0#, 0#, 1#)) Then Fail "Filter: rectangle rejected"
+    If OpeningContourHasNotch(points, segments, Array(0#, 0#, -1#)) Then Fail "Filter: reversed normal changed result"
+    Set points = New Collection
+    Set segments = New Collection
+    polygon = Array(Array(0#, 0#, 0#), Array(0.1, 0#, 0#), Array(0.1, 0.02, 0#), _
+                    Array(0.06, 0.02, 0#), Array(0.06, 0.01, 0#), Array(0.04, 0.01, 0#), _
+                    Array(0.04, 0.02, 0#), Array(0#, 0.02, 0#))
+    For i = 0 To UBound(polygon)
+        points.Add polygon(i)
+        segments.Add Array(i + 1, ((i + 1) Mod (UBound(polygon) + 1)) + 1)
+    Next i
+    If OpeningContourHasNotch(points, segments, Array(0#, 0#, 1#)) = False Then Fail "Filter: open slot accepted"
+    If OpeningContourHasNotch(points, segments, Array(0#, 0#, -1#)) = False Then Fail "Filter: reversed open slot accepted"
+    MsgBox BUILD_ID & ": TestOpeningContours passed; это проверка контура, без проверки BREP модели.", vbInformation
 End Sub
 
 Private Function BestHoleFace(ByVal body As SldWorks.Body2) As SldWorks.Face2
