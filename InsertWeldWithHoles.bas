@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R33_BODY_CONTEXT_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R34_ATTACHED_LEADERS_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -20,7 +20,7 @@ Private Const BREAK_END_CLEARANCE As Double = 0.015
 Private Const DIM_BASE_OFFSET As Double = 0.007
 Private Const DIM_LINE_STEP As Double = 0.006
 Private Const BALLOON_LEFT_OFFSET As Double = 0.02
-Private Const DETAIL_BALLOON_OFFSET As Double = 0.011
+Private Const DETAIL_BALLOON_OFFSET As Double = 0.010
 Private Const DETAIL_BALLOON_RISE As Double = 0.006
 Private Const SIDE_MARGIN As Double = 0.02
 Private Const BOTTOM_MARGIN As Double = 0.04
@@ -100,7 +100,7 @@ Public Sub start()
     Dim config As String, message As String, cleanup As String, errorText As String, prompt As String
     Dim tableTemplate As String, tableWarning As String
     Dim bodies As Collection, cursorY As Double, width As Double, height As Double
-    Dim props As Variant, i As Long, completed As Long, icon As VbMsgBoxStyle, outside As Long
+    Dim props As Variant, i As Long, completed As Long, icon As VbMsgBoxStyle
     Dim runStart As Single, phaseStart As Single
     Dim hadFailure As Boolean, runCompleted As Boolean
     Dim finishFailure As Boolean, hasPartialErrors As Boolean, hasOtherWarnings As Boolean
@@ -238,8 +238,6 @@ Public Sub start()
         icon = vbExclamation
         message = message & vbCrLf & "Таблица списка вырезов: " & tableWarning
     End If
-    If dimensionsOutside > 0 Then icon = vbExclamation
-    If dimensionsOutside > 0 Then message = message & vbCrLf & "Оформление за полями: " & CStr(dimensionsOutside) & ". Требуется компоновка."
     If dimensionWarnings.Count > 0 Then
         icon = vbExclamation
         For i = 1 To dimensionWarnings.Count
@@ -257,15 +255,6 @@ Public Sub start()
         For i = 1 To balloonWarnings.Count
             If i <= 3 Then message = message & vbCrLf & CStr(balloonWarnings(i))
         Next i
-    End If
-    outside = CountOutsideLayout(width, height)
-    If outside > 0 Then
-        icon = vbExclamation
-        message = message & vbCrLf & "За заданными полями листа: " & CStr(outside) & _
-                  ". Выполните компоновку перед печатью/PDF. Масштаб не уменьшался."
-    ElseIf outside < 0 Then
-        icon = vbExclamation
-        message = message & vbCrLf & "Не удалось подсчитать виды за полями; проверьте компоновку вручную."
     End If
     If skipped.Count > 0 Then
         icon = vbExclamation
@@ -332,7 +321,7 @@ Finished:
         If madeTableReady And balloonsFailed > 0 Then hasPartialErrors = True
         hasOtherWarnings = Len(tableWarning) > 0 Or dimensionWarnings.Count > 0 Or breakWarnings.Count > 0 Or _
                            balloonWarnings.Count > 0 Or orientationWarnings.Count > 0 Or balloonsFailed > 0 Or _
-                           pendingPaste Or Len(logPath) = 0 Or outside < 0
+                           pendingPaste Or Len(logPath) = 0
     End If
     If hadFailure Or finishFailure Then
         prompt = "Макрос завершён с ошибкой."
@@ -343,10 +332,7 @@ Finished:
     ElseIf hasPartialErrors Then
         prompt = "Макрос завершён с ошибками."
         icon = vbExclamation
-    ElseIf hasOtherWarnings = False And (dimensionsOutside > 0 Or outside > 0) Then
-        prompt = "Выполнено; часть оформления за полями листа."
-        icon = vbExclamation
-    ElseIf icon = vbExclamation Or hasOtherWarnings Or dimensionsOutside > 0 Or outside <> 0 Then
+    ElseIf icon = vbExclamation Or hasOtherWarnings Then
         prompt = "Макрос выполнен с предупреждениями."
         icon = vbExclamation
     Else
@@ -1361,7 +1347,7 @@ Private Sub PlaceDetail(ByVal view As SldWorks.View, ByRef cursorY As Double, By
     If width <= EPS Or height <= EPS Then Fail "Пустые габариты вида."
     If FitsLayout(width, height, cursorY, sheetWidth) = False Then
         If ALLOW_WORKSPACE_LAYOUT = False Then Fail "Не хватает места в полях листа. Включите ALLOW_WORKSPACE_LAYOUT или освободите лист."
-        WriteLog "Вид сохраняется в рабочей области за полями листа; требуется компоновка перед печатью."
+        WriteLog "Вид размещается в рабочей области за полями листа; это допустимо."
     End If
     position = ReadPosition(view)
     If placeLeft Then
@@ -1548,19 +1534,6 @@ End Function
 
 Private Function OutlineInLayout(ByVal outline As Variant, ByVal sheetWidth As Double, ByVal sheetHeight As Double) As Boolean
     OutlineInLayout = outline(0) >= SIDE_MARGIN And outline(2) <= sheetWidth - SIDE_MARGIN And outline(1) >= BOTTOM_MARGIN And outline(3) <= sheetHeight - SIDE_MARGIN
-End Function
-
-Private Function CountOutsideLayout(ByVal sheetWidth As Double, ByVal sheetHeight As Double) As Long
-    Dim i As Long, view As SldWorks.View, outline As Variant
-    On Error GoTo Unknown
-    For i = 1 To madeViews.Count
-        Set view = madeViews(i)
-        outline = ReadOutline(view)
-        If OutlineInLayout(outline, sheetWidth, sheetHeight) = False Then CountOutsideLayout = CountOutsideLayout + 1
-    Next i
-    Exit Function
-Unknown:
-    CountOutsideLayout = -1
 End Function
 
 Private Function ViewCutListItem(ByVal view As SldWorks.View, ByVal bodyName As String) As String
@@ -2313,7 +2286,6 @@ Private Function TryAddSourcePosition(ByVal view As SldWorks.View, ByVal face As
     Dim entity As SldWorks.Entity, manager As SldWorks.SelectionMgr, data As SldWorks.SelectData
     Dim options As SldWorks.BalloonOptions, actualOptions As SldWorks.BalloonOptions, note As SldWorks.Note
     Dim annotation As SldWorks.Annotation, item As String, position As Variant, registered As Boolean, errorText As String
-    Dim point As Variant, anchor As Variant, utility As SldWorks.MathUtility, transform As SldWorks.MathTransform
     On Error GoTo Failed
     MarkStage "Позиция экземпляра на исходном виде"
     Set entity = face
@@ -2345,15 +2317,10 @@ Private Function TryAddSourcePosition(ByVal view As SldWorks.View, ByVal face As
     If actualOptions Is Nothing Then Fail "Не прочитаны параметры новой позиции."
     If actualOptions.ShowQuantity Then Fail "Позиция исходного вида содержит количество."
     ShowSourceLeader annotation
+    If SourceBalloonAttachedToBody(annotation, name) = False Then Fail "Потеряна привязка после включения линии-выноски."
     If annotation.SetPosition2(x, y, 0#) = False Then Fail "Не размещена позиция исходного вида."
-    point = SourceAttachmentPoint(face)
-    Set utility = app.GetMathUtility
-    Set transform = view.ModelToViewTransform
-    If utility Is Nothing Then Fail "Нет MathUtility для привязки выноски."
-    If transform Is Nothing Then Fail "Нет преобразования для привязки выноски."
-    anchor = NdProject(utility, transform, Array(CDbl(point(0)), CDbl(point(1)), CDbl(point(2))))
-    If annotation.SetLeaderAttachmentPointAtIndex(0, CDbl(anchor(0)), CDbl(anchor(1)), 0#) = False Then _
-        Fail "Не установлено начало выноски у середины изделия."
+    ' The midpoint was supplied through SelectData before insertion. Moving the arrow
+    ' with SetLeaderAttachmentPointAtIndex would turn it into a free attachment.
     position = annotation.GetPosition
     If HasItems(position) = False Then Fail "Не прочитано положение новой позиции."
     If LBound(position) <> 0 Or UBound(position) < 1 Then Fail "Некорректное положение новой позиции."
