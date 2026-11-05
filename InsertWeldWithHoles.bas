@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R30_DETAIL_POSITION_20261105"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R31_TABLE_SORT_20261105"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -21,6 +21,7 @@ Private Const DIM_BASE_OFFSET As Double = 0.007
 Private Const DIM_LINE_STEP As Double = 0.006
 Private Const BALLOON_LEFT_OFFSET As Double = 0.02
 Private Const DETAIL_BALLOON_OFFSET As Double = 0.008
+Private Const DETAIL_BALLOON_RISE As Double = 0.003
 Private Const SIDE_MARGIN As Double = 0.02
 Private Const BOTTOM_MARGIN As Double = 0.04
 Private Const EPS As Double = 0.0000001
@@ -42,6 +43,7 @@ Private sourceLeaderStyle As Long
 Private sourceLeaderStyleKnown As Boolean
 Private madeTable As SldWorks.WeldmentCutListAnnotation
 Private madeTableReady As Boolean
+Private madeTableOwned As Boolean
 Private visited As Object
 Private skipped As Collection
 Private orientationWarnings As Collection
@@ -124,6 +126,7 @@ Public Sub start()
     balloonsFailed = 0
     Set madeTable = Nothing
     madeTableReady = False
+    madeTableOwned = False
     Set partModel = Nothing
     Set drawingModel = Nothing
     oldConfig = ""
@@ -182,12 +185,21 @@ Public Sub start()
     cursorY = height - SIDE_MARGIN
     runStart = Timer
     phaseStart = runStart
-    tableTemplate = TryResolveTableTemplate(tableWarning)
-    If Len(tableTemplate) > 0 Then
-        If TryInsertOutsideCutList(source, config, width, height, tableTemplate, tableWarning) = False Then _
-            WriteLog "Предупреждение таблицы: " & tableWarning
+    Set madeTable = FindSheetCutList()
+    If Not madeTable Is Nothing Then
+        madeTableReady = True
+        WriteLog "Используется существующая таблица списка вырезов текущего листа."
     Else
-        WriteLog "Предупреждение таблицы: " & tableWarning
+        tableTemplate = TryResolveTableTemplate(tableWarning)
+        If Len(tableTemplate) > 0 Then
+            If TryInsertOutsideCutList(source, config, width, height, tableTemplate, tableWarning) = False Then _
+                WriteLog "Предупреждение таблицы: " & tableWarning
+        Else
+            WriteLog "Предупреждение таблицы: " & tableWarning
+        End If
+    End If
+    If madeTableReady Then
+        If TrySortCutList(tableWarning) = False Then WriteLog "Сортировка таблицы: " & tableWarning
     End If
     If madeTableReady = False Then
         MsgBox "Таблица списка вырезов не создана. Выполнение продолжится без позиций.", vbExclamation, "Отверстия"
@@ -217,7 +229,7 @@ Public Sub start()
     If ADD_BALLOONS Then message = message & vbCrLf & "Позиции исходного вида: создано=" & CStr(sourceBalloonsCompleted) & "; не создано=" & CStr(sourceBalloonsFailed) & "."
     If Len(tableWarning) > 0 Then
         icon = vbExclamation
-        message = message & vbCrLf & "Таблица списка вырезов не создана: " & tableWarning
+        message = message & vbCrLf & "Таблица списка вырезов: " & tableWarning
     End If
     If dimensionsOutside > 0 Then icon = vbExclamation
     If dimensionsOutside > 0 Then message = message & vbCrLf & "Оформление за полями: " & CStr(dimensionsOutside) & ". Требуется компоновка."
@@ -531,6 +543,27 @@ Unavailable:
     warning = Err.Description
 End Function
 
+Private Function FindSheetCutList() As SldWorks.WeldmentCutListAnnotation
+    Dim view As SldWorks.View, tables As Variant, table As SldWorks.TableAnnotation, i As Long
+    ' GetFirstView includes the sheet view; following views belong to the active sheet.
+    Set view = drawing.GetFirstView
+    Do While Not view Is Nothing
+        tables = view.GetTableAnnotations
+        If HasItems(tables) Then
+            For i = LBound(tables) To UBound(tables)
+                Set table = tables(i)
+                If Not table Is Nothing Then
+                    If table.Type = swTableAnnotation_WeldmentCutList Then
+                        Set FindSheetCutList = table
+                        Exit Function
+                    End If
+                End If
+            Next i
+        End If
+        Set view = view.GetNextView
+    Loop
+End Function
+
 Private Function TryInsertOutsideCutList(ByVal source As SldWorks.View, ByVal config As String, _
                                          ByVal sheetWidth As Double, ByVal sheetHeight As Double, _
                                          ByVal tableTemplate As String, ByRef warning As String) As Boolean
@@ -566,6 +599,7 @@ Private Function TryInsertOutsideCutList(ByVal source As SldWorks.View, ByVal co
             WriteLog "Таблица: конфигурация=[" & CStr(candidate) & "]; результат=Nothing; COM=" & _
                      CStr(errorNumber) & " " & errorDescription
         Else
+            madeTableOwned = True
             WriteLog "Таблица: создана с конфигурацией=[" & CStr(candidate) & "]"
             Exit For
         End If
@@ -594,6 +628,137 @@ Failed:
     warning = Err.Description
     cleanup = CleanupTable()
     If Len(cleanup) > 0 Then warning = warning & " " & cleanup
+End Function
+
+Private Function CutListProfileRank(ByVal description As String) As Long
+    description = LCase$(description)
+    If InStr(description, "труб") > 0 Or InStr(description, "tube") > 0 Or InStr(description, "pipe") > 0 Then
+        CutListProfileRank = 0
+    ElseIf InStr(description, "угол") > 0 Or InStr(description, "angle") > 0 Then
+        CutListProfileRank = 1
+    ElseIf InStr(description, "швеллер") > 0 Or InStr(description, "channel") > 0 Then
+        CutListProfileRank = 2
+    Else
+        CutListProfileRank = 3 ' Unrecognized profiles retain their relative order at the end.
+    End If
+End Function
+
+Private Function TryCutListLength(ByVal text As String, ByRef length As Double) As Boolean
+    Dim i As Long, ch As String, dots As Long, multiplier As Double
+    text = LCase$(Trim$(Replace(Replace(text, ChrW(160), ""), " ", "")))
+    multiplier = 1#
+    If Right$(text, 2) = "мм" Or Right$(text, 2) = "mm" Then
+        text = Left$(text, Len(text) - 2)
+    ElseIf Right$(text, 1) = "м" Or Right$(text, 1) = "m" Then
+        text = Left$(text, Len(text) - 1)
+        multiplier = 1000#
+    End If
+    text = Replace(text, ",", ".")
+    If Len(text) = 0 Then Exit Function
+    For i = 1 To Len(text)
+        ch = Mid$(text, i, 1)
+        If ch = "." Then
+            dots = dots + 1
+            If dots > 1 Then Exit Function
+        ElseIf ch < "0" Or ch > "9" Then
+            Exit Function
+        End If
+    Next i
+    length = Val(text) * multiplier
+    TryCutListLength = (length > 0#)
+End Function
+
+Private Function CutListBefore(ByVal rank As Long, ByVal length As Double, _
+                               ByVal previousRank As Long, ByVal previousLength As Double) As Boolean
+    If rank <> previousRank Then
+        CutListBefore = (rank < previousRank)
+    ElseIf rank < 3 Then
+        CutListBefore = (length > previousLength)
+    End If
+End Function
+
+Private Function TrySortCutList(ByRef warning As String) As Boolean
+    Dim table As SldWorks.TableAnnotation, row As Long, column As Long, firstRow As Long, lastRow As Long
+    Dim lengthColumn As Long, title As String, description As String, i As Long, j As Long
+    Dim ranks() As Long, lengths() As Double, order() As Long, desired() As Long
+    Dim count As Long, key As Long, sourceIndex As Long, moved As Boolean, recognized As Long
+    On Error GoTo Failed
+    Set table = madeTable
+    lengthColumn = -1
+    firstRow = table.GetHeaderCount
+    If table.GetHeaderStyle <> swTableHeader_Top Or firstRow < 1 Then _
+        Fail "Нужна таблица с заголовком сверху; порядок строк не изменён."
+    lastRow = table.RowCount - 1
+    ' Resolve the displayed length column before moving any row.
+    For row = 0 To firstRow - 1
+        For column = 0 To table.ColumnCount - 1
+            title = LCase$(Trim$(table.DisplayedText(row, column)))
+            If InStr(title, "длина") > 0 Or InStr(title, "length") > 0 Or title = "l" Then
+                If lengthColumn >= 0 And lengthColumn <> column Then _
+                    Fail "Найдено несколько столбцов длины; порядок строк не изменён."
+                lengthColumn = column
+            End If
+        Next column
+    Next row
+    If lengthColumn < 0 Then Fail "Не найден столбец «Длина» / Length; порядок строк не изменён."
+    count = lastRow - firstRow + 1
+    If count < 1 Then Fail "Нет строк списка вырезов для сортировки."
+    ReDim ranks(0 To count - 1)
+    ReDim lengths(0 To count - 1)
+    ReDim order(0 To count - 1)
+    ReDim desired(0 To count - 1)
+    For i = 0 To count - 1
+        row = firstRow + i
+        description = ""
+        For column = 0 To table.ColumnCount - 1
+            description = description & " " & table.DisplayedText(row, column)
+        Next column
+        ranks(i) = CutListProfileRank(description)
+        If ranks(i) < 3 Then
+            recognized = recognized + 1
+            If TryCutListLength(table.DisplayedText(row, lengthColumn), lengths(i)) = False Then _
+                Fail "Не прочитана длина в строке " & CStr(row + 1) & "; порядок строк не изменён."
+        End If
+        order(i) = i
+        desired(i) = i
+    Next i
+    If recognized = 0 Then Fail "В ячейках не найдены названия труб, уголков или швеллеров; порядок строк не изменён."
+    If recognized < count Then warning = "Неизвестные профили оставлены в конце таблицы: " & CStr(count - recognized) & "."
+    ' Stable insertion sort: equal lengths and other profiles keep their original order.
+    For i = 1 To count - 1
+        key = desired(i)
+        j = i - 1
+        Do While j >= 0
+            If CutListBefore(ranks(key), lengths(key), ranks(desired(j)), lengths(desired(j))) = False Then Exit Do
+            desired(j + 1) = desired(j)
+            j = j - 1
+        Loop
+        desired(j + 1) = key
+    Next i
+    For i = 0 To count - 1
+        sourceIndex = i
+        Do While order(sourceIndex) <> desired(i)
+            sourceIndex = sourceIndex + 1
+        Loop
+        If sourceIndex <> i Then
+            ' Move whole linked rows; never replace item numbers or property-linked cell text.
+            If table.MoveRow(firstRow + sourceIndex, swTableItemInsertPosition_Before, firstRow + i) = False Then _
+                Fail "Не удалось переставить строку таблицы; проверьте текущий порядок строк."
+            moved = True
+            key = order(sourceIndex)
+            For j = sourceIndex To i + 1 Step -1
+                order(j) = order(j - 1)
+            Next j
+            order(i) = key
+        End If
+    Next i
+    drawingModel.EditRebuild3
+    WriteLog "Таблица отсортирована: трубы, уголки, швеллеры; длина по убыванию. Остальные профили в конце."
+    TrySortCutList = True
+    Exit Function
+Failed:
+    warning = Err.Description
+    If moved Then warning = warning & " Часть строк уже переставлена."
 End Function
 
 Private Sub AddTableConfiguration(ByVal candidates As Collection, ByVal seen As Object, ByVal name As String)
@@ -1483,7 +1648,7 @@ Private Function TryAddPosition(ByVal view As SldWorks.View, ByRef warning As St
     HidePositionLeader annotation, note
     MarkStage "Окончательное размещение позиции"
     x = CDbl(outline(0)) - DETAIL_BALLOON_OFFSET
-    y = (CDbl(outline(1)) + CDbl(outline(3))) / 2#
+    y = (CDbl(outline(1)) + CDbl(outline(3))) / 2# + DETAIL_BALLOON_RISE
     If annotation.SetPosition2(x, y, 0#) = False Then Fail "Не установлено положение позиции слева от детали."
     MarkStage "Проверка позиции"
     position = annotation.GetPosition
@@ -1815,16 +1980,36 @@ Failed:
     On Error GoTo 0
 End Sub
 
+Private Function SourceAttachmentPoint(ByVal face As SldWorks.Face2) As Variant
+    Dim body As SldWorks.Body2, box As Variant, point As Variant
+    Set body = face.GetBody
+    If body Is Nothing Then Fail "Не найдено тело для привязки выноски."
+    box = body.GetBodyBox
+    If HasItems(box) = False Then Fail "Не получены границы тела для привязки выноски."
+    If LBound(box) <> 0 Or UBound(box) < 5 Then Fail "Некорректные границы тела для привязки выноски."
+    point = face.GetClosestPointOn((CDbl(box(0)) + CDbl(box(3))) / 2#, _
+                                  (CDbl(box(1)) + CDbl(box(4))) / 2#, _
+                                  (CDbl(box(2)) + CDbl(box(5))) / 2#)
+    If HasItems(point) = False Then Fail "Не найдена точка привязки на грани."
+    If LBound(point) <> 0 Or UBound(point) < 2 Then Fail "Некорректная точка привязки на грани."
+    SourceAttachmentPoint = point
+End Function
+
+Private Sub SetSourceSelectionPoint(ByVal face As SldWorks.Face2, ByVal data As SldWorks.SelectData)
+    Dim point As Variant
+    point = SourceAttachmentPoint(face)
+    data.X = CDbl(point(0))
+    data.Y = CDbl(point(1))
+    data.Z = CDbl(point(2))
+End Sub
+
 Private Function TrySourceTextPosition(ByVal face As SldWorks.Face2, ByVal utility As SldWorks.MathUtility, _
                                        ByVal transform As SldWorks.MathTransform, ByVal outline As Variant, _
                                        ByRef x As Double, ByRef y As Double, ByRef warning As String) As Boolean
-    Dim box As Variant, coords As Variant
+    Dim point As Variant, coords As Variant
     On Error GoTo Failed
-    box = face.GetBox
-    If HasItems(box) = False Then Fail "Не получены границы грани исходного вида."
-    If LBound(box) <> 0 Or UBound(box) < 5 Then Fail "Некорректные границы грани исходного вида."
-    coords = NdProject(utility, transform, Array((CDbl(box(0)) + CDbl(box(3))) / 2#, _
-                       (CDbl(box(1)) + CDbl(box(4))) / 2#, (CDbl(box(2)) + CDbl(box(5))) / 2#))
+    point = SourceAttachmentPoint(face)
+    coords = NdProject(utility, transform, Array(CDbl(point(0)), CDbl(point(1)), CDbl(point(2))))
     If CDbl(coords(0)) < (CDbl(outline(0)) + CDbl(outline(2))) / 2# Then
         x = CDbl(coords(0)) - 0.015
     Else
@@ -1899,6 +2084,7 @@ Private Function TryAddSourcePosition(ByVal view As SldWorks.View, ByVal face As
     Dim entity As SldWorks.Entity, manager As SldWorks.SelectionMgr, data As SldWorks.SelectData
     Dim options As SldWorks.BalloonOptions, actualOptions As SldWorks.BalloonOptions, note As SldWorks.Note
     Dim annotation As SldWorks.Annotation, item As String, position As Variant, registered As Boolean, errorText As String
+    Dim point As Variant, anchor As Variant, utility As SldWorks.MathUtility, transform As SldWorks.MathTransform
     On Error GoTo Failed
     MarkStage "Позиция экземпляра на исходном виде"
     Set entity = face
@@ -1907,6 +2093,7 @@ Private Function TryAddSourcePosition(ByVal view As SldWorks.View, ByVal face As
     Set data = manager.CreateSelectData
     If data Is Nothing Then Fail "Не создан контекст выбора исходного вида."
     data.View = view
+    SetSourceSelectionPoint face, data
     drawingModel.ClearSelection2 True
     If entity.Select4(False, data) = False Then Fail "Не выбрана видимая грань экземпляра."
     If manager.GetSelectedObjectCount2(-1) <> 1 Then Fail "Выбрана не одна грань экземпляра."
@@ -1930,6 +2117,14 @@ Private Function TryAddSourcePosition(ByVal view As SldWorks.View, ByVal face As
     If actualOptions.ShowQuantity Then Fail "Позиция исходного вида содержит количество."
     ShowSourceLeader annotation
     If annotation.SetPosition2(x, y, 0#) = False Then Fail "Не размещена позиция исходного вида."
+    point = SourceAttachmentPoint(face)
+    Set utility = app.GetMathUtility
+    Set transform = view.ModelToViewTransform
+    If utility Is Nothing Then Fail "Нет MathUtility для привязки выноски."
+    If transform Is Nothing Then Fail "Нет преобразования для привязки выноски."
+    anchor = NdProject(utility, transform, Array(CDbl(point(0)), CDbl(point(1)), CDbl(point(2))))
+    If annotation.SetLeaderAttachmentPointAtIndex(0, CDbl(anchor(0)), CDbl(anchor(1)), 0#) = False Then _
+        Fail "Не установлено начало выноски у середины изделия."
     position = annotation.GetPosition
     If HasItems(position) = False Then Fail "Не прочитано положение новой позиции."
     If LBound(position) <> 0 Or UBound(position) < 1 Then Fail "Некорректное положение новой позиции."
@@ -2078,6 +2273,7 @@ Private Function CleanupTable() As String
     On Error GoTo Failed
     madeTableReady = False
     If madeTable Is Nothing Then Exit Function
+    If madeTableOwned = False Then Exit Function
     Set table = madeTable
     Set annotation = table.GetAnnotation
     If annotation Is Nothing Then GoTo Failed
@@ -2086,6 +2282,7 @@ Private Function CleanupTable() As String
     If drawingModel.Extension.DeleteSelection2(swDelete_Absorbed) = False Then GoTo Failed
     Set madeTable = Nothing
     madeTableReady = False
+    madeTableOwned = False
     CleanupTable = "Созданная этим запуском таблица удалена."
     Exit Function
 Failed:
@@ -2160,6 +2357,26 @@ Private Function DescribeError(ByVal number As Long, ByVal origin As String, ByV
 End Function
 
 ' Native scalar-transform smoke test. No document/model window is required.
+Public Sub TestCutListSort()
+    Dim length As Double
+    If CutListProfileRank("Труба квадратная 80x80") <> 0 Then Fail "Sort: pipe classification failed"
+    If CutListProfileRank("Уголок 50x50") <> 1 Then Fail "Sort: angle classification failed"
+    If CutListProfileRank("Швеллер 12") <> 2 Then Fail "Sort: channel classification failed"
+    If CutListProfileRank("Лист 8") <> 3 Then Fail "Sort: other profile classification failed"
+    If TryCutListLength("1 250,5 мм", length) = False Then Fail "Sort: millimetres not parsed"
+    If Abs(length - 1250.5) > EPS Then Fail "Sort: incorrect millimetres"
+    If TryCutListLength("1.25 m", length) = False Then Fail "Sort: metres not parsed"
+    If Abs(length - 1250#) > EPS Then Fail "Sort: incorrect metres"
+    If TryCutListLength("SW-Length@@@Part", length) Then Fail "Sort: unresolved expression accepted"
+    If TryCutListLength("0", length) Then Fail "Sort: zero length accepted"
+    If CutListBefore(0, 100#, 1, 200#) = False Then Fail "Sort: pipe must precede angle"
+    If CutListBefore(1, 100#, 2, 200#) = False Then Fail "Sort: angle must precede channel"
+    If CutListBefore(0, 200#, 0, 100#) = False Then Fail "Sort: descending length failed"
+    If CutListBefore(0, 100#, 0, 100#) Then Fail "Sort: equal lengths must remain stable"
+    If CutListBefore(3, 200#, 3, 100#) Then Fail "Sort: other profiles must remain stable"
+    MsgBox BUILD_ID & ": TestCutListSort passed; без перестановки строк в SOLIDWORKS.", vbInformation
+End Sub
+
 Public Sub TestGeometry()
     Dim rotation(15) As Double, normal As Variant
     On Error GoTo Failed
