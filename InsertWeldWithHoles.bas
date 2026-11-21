@@ -2,7 +2,7 @@ Attribute VB_Name = "InsertWeldWithHoles"
 Option Explicit
 
 ' Replace ONLY this module in the ORIGINAL working SWP; entry point: start.
-Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R39_REDUCE_API_CALLS_20261121"
+Private Const BUILD_ID As String = "DRILL_COPY_VIEW_R40_REUSE_CUT_LIST_BALLOONS_20261121"
 Private Const VERBOSE_VIEW_SNAPSHOTS As Boolean = False
 Private Const AUTO_DIMENSIONS As Boolean = True
 Private Const ADD_BALLOONS As Boolean = True
@@ -106,10 +106,11 @@ End Type
 ' END NATIVE DIMENSIONS DECLARATIONS
 
 Public Sub start()
-    Dim source As SldWorks.View, sheet As SldWorks.Sheet
+    Dim source As SldWorks.View, detail As SldWorks.View, sheet As SldWorks.Sheet
     Dim config As String, message As String, cleanup As String, errorText As String, prompt As String
-    Dim tableTemplate As String, tableWarning As String
+    Dim tableTemplate As String, tableWarning As String, probeWarning As String
     Dim bodies As Collection, cursorY As Double, width As Double, height As Double
+    Dim cutListProbes() As SldWorks.Note
     Dim props As Variant, i As Long, completed As Long, icon As VbMsgBoxStyle
     Dim runStart As Single, phaseStart As Single
     Dim hadFailure As Boolean, runCompleted As Boolean
@@ -220,14 +221,26 @@ Public Sub start()
         MsgBox "Таблица списка вырезов не создана. Выполнение продолжится без позиций.", vbExclamation, "Отверстия"
     End If
     WriteLog "Время: таблица=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с"
+    ReDim cutListProbes(1 To bodies.Count)
     phaseStart = Timer
     For i = 1 To bodies.Count
         currentBody = CStr(bodies(i))
-        If ProcessBody(source, config, i, cursorY, width) Then completed = completed + 1
+        If ProcessBody(source, config, i, cursorY, width) Then
+            completed = completed + 1
+            If madeTableReady Then
+                Set detail = madeViews(completed)
+                If TryAddCutListProbe(detail, CStr(madeBodyNames(completed)), cutListProbes(completed), probeWarning) = False Then _
+                    WriteLog "Номер строки будет проверен после создания видов: " & probeWarning
+            End If
+        End If
     Next i
     WriteLog "Время: виды=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с"
+    If madeTableReady And completed > 0 Then
+        phaseStart = Timer
+        AlignDetailsWithCutList cutListProbes
+        WriteLog "Время: согласование списка вырезов=" & Format$(ElapsedSeconds(phaseStart), "0.00") & " с"
+    End If
     phaseStart = Timer
-    If madeTableReady And completed > 0 Then AlignDetailsWithCutList
     If AUTO_DIMENSIONS And completed > 0 Then
         DimensionAndArrange width, height
     ElseIf completed > 0 Then
@@ -294,6 +307,7 @@ Failed:
     errorText = DescribeError(Err.Number, Err.Source, Err.Description, Erl)
     WriteLog errorText
     cleanup = CleanupSourcePositions()
+    cleanup = cleanup & CleanupCutListProbes(cutListProbes, completed)
     cleanup = cleanup & CleanupSince(0)
     message = "Операция остановлена: " & errorText & vbCrLf & cleanup
     cleanup = CleanupTable()
@@ -1823,17 +1837,21 @@ Private Function OutlineInLayout(ByVal outline As Variant, ByVal sheetWidth As D
     OutlineInLayout = outline(0) >= SIDE_MARGIN And outline(2) <= sheetWidth - SIDE_MARGIN And outline(1) >= BOTTOM_MARGIN And outline(3) <= sheetHeight - SIDE_MARGIN
 End Function
 
-Private Function ViewCutListItem(ByVal view As SldWorks.View, ByVal bodyName As String) As String
+Private Function TryAddCutListProbe(ByVal view As SldWorks.View, ByVal bodyName As String, _
+                                    ByRef probe As SldWorks.Note, ByRef warning As String) As Boolean
     Dim face As SldWorks.Face2, entity As SldWorks.Entity, data As SldWorks.SelectData
-    Dim options As SldWorks.BalloonOptions, note As SldWorks.Note
-    Dim holes As Long, area As Double, item As String, warning As String, errorText As String
+    Dim options As SldWorks.BalloonOptions
+    Dim holes As Long, area As Double
     On Error GoTo Failed
-    ' Each lookup must use this view's body, not the last body processed by ProcessBody.
     currentBody = bodyName
     currentView = view.GetName2
     currentDirection = 0
     If Len(bodyName) = 0 Then Fail "Не задано тело для определения строки списка вырезов."
     MarkStage "Определение строки списка вырезов для тела [" & bodyName & "]"
+    If Not probe Is Nothing Then
+        If TryDeleteSourceNote(probe) = False Then Fail "Не удалена временная позиция."
+        Set probe = Nothing
+    End If
     Set face = FindVisibleHoleFace(view, holes, area)
     If face Is Nothing Then Fail "Не найдена грань для определения строки списка вырезов."
     Set entity = face
@@ -1847,20 +1865,15 @@ Private Function ViewCutListItem(ByVal view As SldWorks.View, ByVal bodyName As 
     options.Style = swBS_None
     options.UpperTextContent = swBalloonTextItemNumber
     options.ShowQuantity = False
-    Set note = drawingModel.Extension.InsertBOMBalloon2(options)
-    If note Is Nothing Then Fail "Не создана временная связанная позиция."
-    If TryReadItemNumber(note, item, warning) = False Then Fail warning
-    If TryDeleteSourceNote(note) = False Then Fail "Не удалена временная позиция."
-    Set note = Nothing
+    Set probe = drawingModel.Extension.InsertBOMBalloon2(options)
+    If probe Is Nothing Then Fail "Не создана временная связанная позиция."
     drawingModel.ClearSelection2 True
-    ViewCutListItem = item
+    TryAddCutListProbe = True
     Exit Function
 Failed:
-    errorText = Err.Description
-    If Not note Is Nothing Then
-        If TryDeleteSourceNote(note) = False Then errorText = errorText & "; временная позиция осталась на виде"
-    End If
-    Fail "Не определена строка вида [" & view.GetName2 & "]: " & errorText
+    warning = "Не определена строка вида [" & currentView & "]: " & Err.Description
+    On Error Resume Next
+    drawingModel.ClearSelection2 True
 End Function
 
 Private Function DetailFirstOrder(ByVal count As Long, ByVal selectedRows As Object) As Long()
@@ -1906,14 +1919,15 @@ Public Sub TestDetailFirstOrder()
     MsgBox BUILD_ID & ": TestDetailFirstOrder passed; без изменения таблицы в SOLIDWORKS.", vbInformation
 End Sub
 
-Private Sub AlignDetailsWithCutList()
+Private Sub AlignDetailsWithCutList(ByRef probes() As SldWorks.Note)
     Dim table As SldWorks.TableAnnotation, feature As SldWorks.WeldmentCutListFeature
-    Dim itemRows As Object, selectedRows As Object, rowBodies As Object, rowViews As Object
+    Dim itemRows As Object, selectedRows As Object
     Dim views As Collection, names As Collection, view As SldWorks.View
     Dim firstRow As Long, count As Long, itemColumn As Long, row As Long, column As Long
-    Dim i As Long, j As Long, target As Long, sourceIndex As Long, originalRow As Long, key As Long
-    Dim order() As Long, desired() As Long, item As String
-    Dim savedKeepNumbers As Boolean, savedStart As Long, captured As Boolean, errorText As String
+    Dim i As Long, j As Long, detailIndex As Long, sourceIndex As Long, originalRow As Long, key As Long
+    Dim order() As Long, desired() As Long, item As String, expectedItem As String
+    Dim savedKeepNumbers As Boolean, savedStart As Long, numberingChanged As Boolean, needsRenumber As Boolean
+    Dim errorText As String, warning As String, cleanup As String
     On Error GoTo Failed
     MarkStage "Согласование таблицы и порядка вынесенных видов"
     Set table = madeTable
@@ -1921,7 +1935,7 @@ Private Sub AlignDetailsWithCutList()
     If feature Is Nothing Then Fail "Нет параметров нумерации списка вырезов."
     savedKeepNumbers = feature.KeepCurrentItemNumbers
     savedStart = feature.SequenceStartNumber
-    captured = True
+    needsRenumber = savedKeepNumbers Or savedStart <> 1
     If table.GetHeaderStyle <> swTableHeader_Top Then Fail "Для нумерации нужен заголовок таблицы сверху."
     firstRow = table.GetHeaderCount
     count = table.RowCount - firstRow
@@ -1936,23 +1950,23 @@ Private Sub AlignDetailsWithCutList()
     If itemColumn < 0 Then Fail "В таблице нет связанного столбца номеров позиций."
     Set itemRows = CreateObject("Scripting.Dictionary")
     Set selectedRows = CreateObject("Scripting.Dictionary")
-    Set rowBodies = CreateObject("Scripting.Dictionary")
-    Set rowViews = CreateObject("Scripting.Dictionary")
-    For row = firstRow To table.RowCount - 1
+    For row = firstRow To firstRow + count - 1
         item = Trim$(table.DisplayedText(row, itemColumn))
         If Len(item) = 0 Or itemRows.Exists(item) Then Fail "Пустой или повторный номер строки таблицы."
         itemRows.Add item, row - firstRow
+        If item <> CStr(row - firstRow + 1) Then needsRenumber = True
     Next row
-    ' A native temporary balloon gives the actual row association, independent of profile names.
+    ' The temporary balloon remains linked while its table row is moved and renumbered.
     For i = 1 To madeViews.Count
-        Set view = madeViews(i)
-        item = ViewCutListItem(view, CStr(madeBodyNames(i)))
-        If itemRows.Exists(item) = False Then Fail "Номер вида не найден в таблице: " & item
+        If TryReadItemNumber(probes(i), item, warning) = False Or Not itemRows.Exists(item) Then
+            Set view = madeViews(i)
+            If TryAddCutListProbe(view, CStr(madeBodyNames(i)), probes(i), warning) = False Then Fail warning
+            If TryReadItemNumber(probes(i), item, warning) = False Then Fail warning
+            If itemRows.Exists(item) = False Then Fail "Номер вида не найден в таблице: " & item
+        End If
         originalRow = CLng(itemRows(item))
         If selectedRows.Exists(CStr(originalRow)) Then Fail "Два вида соответствуют одной строке таблицы."
-        selectedRows.Add CStr(originalRow), True
-        rowBodies.Add CStr(originalRow), CStr(madeBodyNames(i))
-        rowViews.Add CStr(originalRow), view
+        selectedRows.Add CStr(originalRow), i
     Next i
     ReDim order(0 To count - 1)
     desired = DetailFirstOrder(count, selectedRows)
@@ -1960,19 +1974,21 @@ Private Sub AlignDetailsWithCutList()
     Set names = New Collection
     For i = 0 To count - 1
         order(i) = i
-        If selectedRows.Exists(CStr(i)) Then
-            views.Add rowViews(CStr(i))
-            names.Add CStr(rowBodies(CStr(i)))
-        End If
     Next i
-    ' Hold item identities while promoting selected rows, then renumber the complete table.
-    feature.KeepCurrentItemNumbers = True
-    For i = 0 To count - 1
+    ' Promoting the detail rows preserves the relative order of all remaining rows.
+    For i = 0 To madeViews.Count - 1
+        detailIndex = CLng(selectedRows(CStr(desired(i))))
+        views.Add madeViews(detailIndex)
+        names.Add madeBodyNames(detailIndex)
         sourceIndex = i
         Do While order(sourceIndex) <> desired(i)
             sourceIndex = sourceIndex + 1
         Loop
         If sourceIndex <> i Then
+            If Not numberingChanged Then
+                numberingChanged = True
+                feature.KeepCurrentItemNumbers = True
+            End If
             If table.MoveRow(firstRow + sourceIndex, swTableItemInsertPosition_Before, firstRow + i) = False Then _
                 Fail "Не переставлена строка для сквозной нумерации."
             key = order(sourceIndex)
@@ -1982,16 +1998,30 @@ Private Sub AlignDetailsWithCutList()
             order(i) = key
         End If
     Next i
-    feature.SequenceStartNumber = 1
-    feature.KeepCurrentItemNumbers = False
-    drawingModel.EditRebuild3
-    For i = 1 To views.Count
-        If Trim$(table.DisplayedText(firstRow + i - 1, itemColumn)) <> CStr(i) Then _
-            Fail "Не подтверждена сквозная нумерация таблицы от 1."
-        Set view = views(i)
-        If ViewCutListItem(view, CStr(names(i))) <> CStr(i) Then _
-            Fail "Связанный номер вида не совпал со строкой таблицы: " & CStr(i)
-    Next i
+    If numberingChanged Or needsRenumber Then
+        If Not numberingChanged Then
+            numberingChanged = True
+            feature.KeepCurrentItemNumbers = True
+        End If
+        feature.SequenceStartNumber = 1
+        feature.KeepCurrentItemNumbers = False
+        drawingModel.EditRebuild3
+        For i = 1 To views.Count
+            expectedItem = CStr(i)
+            If Trim$(table.DisplayedText(firstRow + i - 1, itemColumn)) <> expectedItem Then _
+                Fail "Не подтверждена сквозная нумерация таблицы от 1."
+            detailIndex = CLng(selectedRows(CStr(desired(i - 1))))
+            If TryReadItemNumber(probes(detailIndex), item, warning) = False Or item <> expectedItem Then
+                ' Refresh only the affected link when a host leaves an existing balloon stale.
+                Set view = views(i)
+                If TryAddCutListProbe(view, CStr(names(i)), probes(detailIndex), warning) = False Then Fail warning
+                If TryReadItemNumber(probes(detailIndex), item, warning) = False Then Fail warning
+                If item <> expectedItem Then Fail "Связанный номер вида не совпал со строкой таблицы: " & expectedItem
+            End If
+        Next i
+    End If
+    cleanup = CleanupCutListProbes(probes, views.Count)
+    If Len(cleanup) > 0 Then Fail cleanup
     Set madeViews = views
     Set madeBodyNames = names
     detailNumberingPrepared = True
@@ -2000,7 +2030,7 @@ Private Sub AlignDetailsWithCutList()
 Failed:
     errorText = Err.Description
     On Error Resume Next
-    If captured Then
+    If numberingChanged Then
         feature.SequenceStartNumber = savedStart
         feature.KeepCurrentItemNumbers = savedKeepNumbers
         drawingModel.EditRebuild3
@@ -2541,6 +2571,56 @@ Private Function TryDeleteSourceNote(ByVal note As SldWorks.Note) As Boolean
     If drawingModel.SelectionManager.GetSelectedObjectCount2(-1) <> 1 Then Exit Function
     TryDeleteSourceNote = drawingModel.Extension.DeleteSelection2(0)
 Failed:
+End Function
+
+Private Function TryDeleteCutListProbesTogether(ByRef probes() As SldWorks.Note, ByVal viewCount As Long) As Boolean
+    Dim annotations() As Object, i As Long, count As Long
+    On Error GoTo Failed
+    ReDim annotations(0 To viewCount - 1)
+    For i = 1 To viewCount
+        If Not probes(i) Is Nothing Then
+            Set annotations(count) = probes(i).GetAnnotation
+            If annotations(count) Is Nothing Then Exit Function
+            count = count + 1
+        End If
+    Next i
+    If count = 0 Then
+        TryDeleteCutListProbesTogether = True
+        Exit Function
+    End If
+    ReDim Preserve annotations(0 To count - 1)
+    drawingModel.ClearSelection2 True
+    If drawingModel.Extension.MultiSelect2(annotations, False, Nothing) <> count Then Exit Function
+    If drawingModel.SelectionManager.GetSelectedObjectCount2(-1) <> count Then Exit Function
+    TryDeleteCutListProbesTogether = drawingModel.Extension.DeleteSelection2(0)
+    Exit Function
+Failed:
+End Function
+
+Private Function CleanupCutListProbes(ByRef probes() As SldWorks.Note, ByVal viewCount As Long) As String
+    Dim i As Long, remaining As Long
+    On Error GoTo Failed
+    If viewCount = 0 Then Exit Function
+    If TryDeleteCutListProbesTogether(probes, viewCount) Then
+        For i = 1 To viewCount
+            Set probes(i) = Nothing
+        Next i
+    Else
+        For i = 1 To viewCount
+            If Not probes(i) Is Nothing Then
+                If TryDeleteSourceNote(probes(i)) Then
+                    Set probes(i) = Nothing
+                Else
+                    remaining = remaining + 1
+                End If
+            End If
+        Next i
+    End If
+    drawingModel.ClearSelection2 True
+    If remaining > 0 Then CleanupCutListProbes = " Не удалены временные позиции списка вырезов: " & CStr(remaining) & "."
+    Exit Function
+Failed:
+    CleanupCutListProbes = " Ошибка удаления временных позиций списка вырезов: " & Err.Description
 End Function
 
 Private Function CleanupSourcePositions() As String
